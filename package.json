@@ -1,24 +1,31 @@
-
 {
-  "name": "chatbot-using-api-main",
+  "name": "genie-backend",
   "version": "1.0.0",
-  "description": "",
-  "main": "node.js",
+  "description": "Genie AI backend with memory engine and chat sessions",
+  "type": "module",
+  "main": "server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node server.js"
   },
-  "keywords": [],
-  "author": "",
+  "engines": {
+    "node": ">=18 <23"
+  },
+  "keywords": [
+    "chatbot",
+    "ai",
+    "express",
+    "render",
+    "replit-db",
+    "memory-engine"
+  ],
+  "author": "Anup Singh",
   "license": "ISC",
   "dependencies": {
     "@replit/database": "^3.0.1",
-    "body-parser": "^2.2.0",
     "cors": "^2.8.5",
     "dotenv": "^17.2.1",
     "express": "^5.1.0",
     "express-rate-limit": "^8.2.0",
-    "fs-extra": "^11.3.2",
-    "multer": "^2.0.2",
     "node-fetch": "^2.7.0"
   }
 }
