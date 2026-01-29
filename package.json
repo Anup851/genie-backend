@@ -21,11 +21,14 @@
   "author": "Anup Singh",
   "license": "ISC",
   "dependencies": {
-    "@replit/database": "^3.0.1",
-    "cors": "^2.8.5",
-    "dotenv": "^17.2.1",
-    "express": "^5.1.0",
-    "express-rate-limit": "^8.2.0",
-    "node-fetch": "^2.7.0"
-  }
+  "@replit/database": "^3.0.1",
+  "cors": "^2.8.5",
+  "dotenv": "^16.4.5",
+  "express": "^4.19.2",
+  "express-rate-limit": "^7.3.0",
+  "node-fetch": "^3.3.2",
+  "bcryptjs": "^2.4.3",
+  "jsonwebtoken": "^9.0.2"
+}
+
 }
