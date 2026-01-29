@@ -1,26 +1,5 @@
 // server.js
-// Genie Backend - Memory Engine v3 + Chat Sessions (History Sidebar Ready)
-import { createClient } from "@supabase/supabase-js";
-
-const supaPublic = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_ANON_KEY
-);
-
-const supaAdmin = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
-async function requireAuth(req,res,next){
-  const header = req.headers.authorization || "";
-  const token = header.replace("Bearer ","");
-
-  const { data } = await supaPublic.auth.getUser(token);
-  if(!data?.user) return res.status(401).json({error:"login required"});
-
-  req.user = data.user;
-  next();
-}
+// Genie Backend - Memory Engine v3 + Chat Sessions + Authentication
 
 import Database from "@replit/database";
 import express from "express";
@@ -28,6 +7,8 @@ import fetch from "node-fetch";
 import cors from "cors";
 import dotenv from "dotenv";
 import rateLimit from "express-rate-limit";
+import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
 
 dotenv.config();
 
@@ -42,13 +23,24 @@ if (!process.env.OPENROUTER_API_KEY) {
   process.exit(1);
 }
 
+// JWT Secret
+const JWT_SECRET = process.env.JWT_SECRET || 'genie-secret-key-change-in-production';
+
 // --- Rate Limiting ---
 const chatLimiter = rateLimit({
   windowMs: 1 * 60 * 1000, // 1 minute
   max: 10,
-  keyGenerator: (req) => req.body?.userId || "anonymous",
+  keyGenerator: (req) => req.user?.id || req.body?.userId || "anonymous",
   skip: (req) => req.method === "OPTIONS",
   message: { error: "Too many requests. Please wait a moment." },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 20,
+  message: { error: "Too many authentication attempts. Please try again later." },
   standardHeaders: true,
   legacyHeaders: false,
 });
@@ -73,15 +65,231 @@ app.use((req, res, next) => {
 // --- Request logging ---
 app.use((req, res, next) => {
   console.log(
-    `${new Date().toISOString()} - ${req.method} ${req.path} - User: ${
-      req.body?.userId || req.params?.userId || "unknown"
-    }`,
+    `${new Date().toISOString()} - ${req.method} ${req.path} - IP: ${req.ip}`
   );
   next();
 });
 
 /* ============================================================
-   Memory Engine v3 - Safe extraction & storage
+   AUTHENTICATION MIDDLEWARE & FUNCTIONS
+   ============================================================ */
+
+// Auth middleware
+const authMiddleware = async (req, res, next) => {
+    try {
+        const token = req.header('Authorization')?.replace('Bearer ', '');
+        
+        if (!token) {
+            return res.status(401).json({ error: 'Authentication required' });
+        }
+        
+        const decoded = jwt.verify(token, JWT_SECRET);
+        
+        // Get user from database
+        const userKey = `auth_user_${decoded.userId}`;
+        const user = await db.get(userKey);
+        
+        if (!user) {
+            return res.status(401).json({ error: 'User not found' });
+        }
+        
+        req.user = user;
+        req.userId = user.id;
+        next();
+    } catch (error) {
+        console.error('Auth middleware error:', error.message);
+        if (error.name === 'JsonWebTokenError') {
+            return res.status(401).json({ error: 'Invalid token' });
+        }
+        if (error.name === 'TokenExpiredError') {
+            return res.status(401).json({ error: 'Token expired' });
+        }
+        res.status(401).json({ error: 'Please authenticate' });
+    }
+};
+
+// User functions
+async function createUser(email, password, name) {
+    const emailKey = `auth_email_${email.toLowerCase()}`;
+    
+    // Check if user exists
+    const existing = await db.get(emailKey);
+    if (existing) {
+        throw new Error('User already exists');
+    }
+    
+    // Hash password
+    const hashedPassword = await bcrypt.hash(password, 10);
+    
+    // Create user ID
+    const userId = `user_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    
+    // User data
+    const userData = {
+        id: userId,
+        email: email.toLowerCase(),
+        password: hashedPassword,
+        name,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+    };
+    
+    // Store user data
+    await db.set(emailKey, userId); // email -> userId mapping
+    await db.set(`auth_user_${userId}`, userData); // userId -> user data
+    
+    return userData;
+}
+
+async function findUserByEmail(email) {
+    const emailKey = `auth_email_${email.toLowerCase()}`;
+    const userId = await db.get(emailKey);
+    if (!userId) return null;
+    
+    return await db.get(`auth_user_${userId}`);
+}
+
+async function findUserById(userId) {
+    return await db.get(`auth_user_${userId}`);
+}
+
+/* ============================================================
+   AUTHENTICATION ENDPOINTS
+   ============================================================ */
+
+// Register endpoint
+app.post('/api/auth/register', authLimiter, async (req, res) => {
+    try {
+        const { email, password, name } = req.body;
+        
+        // Validate input
+        if (!email || !password || !name) {
+            return res.status(400).json({ error: 'All fields are required' });
+        }
+        
+        // Email validation
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(email)) {
+            return res.status(400).json({ error: 'Invalid email format' });
+        }
+        
+        // Password validation
+        if (password.length < 6) {
+            return res.status(400).json({ error: 'Password must be at least 6 characters' });
+        }
+        
+        // Create user
+        const user = await createUser(email, password, name);
+        
+        // Generate JWT token
+        const token = jwt.sign(
+            { userId: user.id, email: user.email },
+            JWT_SECRET,
+            { expiresIn: '7d' }
+        );
+        
+        // Remove password from response
+        const { password: _, ...userWithoutPassword } = user;
+        
+        res.status(201).json({
+            success: true,
+            token,
+            user: userWithoutPassword,
+            message: 'Registration successful'
+        });
+    } catch (error) {
+        console.error('Registration error:', error.message);
+        if (error.message === 'User already exists') {
+            return res.status(400).json({ error: error.message });
+        }
+        res.status(500).json({ error: 'Registration failed' });
+    }
+});
+
+// Login endpoint
+app.post('/api/auth/login', authLimiter, async (req, res) => {
+    try {
+        const { email, password } = req.body;
+        
+        // Validate input
+        if (!email || !password) {
+            return res.status(400).json({ error: 'Email and password required' });
+        }
+        
+        // Find user
+        const user = await findUserByEmail(email);
+        if (!user) {
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+        
+        // Check password
+        const isPasswordValid = await bcrypt.compare(password, user.password);
+        if (!isPasswordValid) {
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+        
+        // Generate JWT token
+        const token = jwt.sign(
+            { userId: user.id, email: user.email },
+            JWT_SECRET,
+            { expiresIn: '7d' }
+        );
+        
+        // Update last login
+        user.updatedAt = new Date().toISOString();
+        user.lastLogin = new Date().toISOString();
+        await db.set(`auth_user_${user.id}`, user);
+        
+        // Remove password from response
+        const { password: _, ...userWithoutPassword } = user;
+        
+        res.json({
+            success: true,
+            token,
+            user: userWithoutPassword,
+            message: 'Login successful'
+        });
+    } catch (error) {
+        console.error('Login error:', error);
+        res.status(500).json({ error: 'Login failed' });
+    }
+});
+
+// Get current user
+app.get('/api/auth/me', authMiddleware, async (req, res) => {
+    try {
+        const { password: _, ...userWithoutPassword } = req.user;
+        res.json({
+            success: true,
+            user: userWithoutPassword
+        });
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to fetch user data' });
+    }
+});
+
+// Logout (client-side only)
+app.post('/api/auth/logout', authMiddleware, async (req, res) => {
+    res.json({ success: true, message: 'Logged out successfully' });
+});
+
+// Check if email exists (for registration)
+app.post('/api/auth/check-email', async (req, res) => {
+    try {
+        const { email } = req.body;
+        if (!email) {
+            return res.status(400).json({ error: 'Email required' });
+        }
+        
+        const user = await findUserByEmail(email);
+        res.json({ exists: !!user });
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to check email' });
+    }
+});
+
+/* ============================================================
+   MEMORY ENGINE v3 - Safe extraction & storage
    ============================================================ */
 
 const MEMORY_CATEGORIES = {
@@ -143,7 +351,7 @@ const BANNED_MEMORY_KEYS = new Set([
   "code",
   "bot",
   "chatbot",
-  "app",
+    "app",
   "website",
   "project",
   "error",
@@ -409,7 +617,6 @@ async function createSession(userId, title = "New chat") {
   return session;
 }
 
-// If chatId comes from client, ensure it exists; if not, create it with that id.
 async function ensureSession(userId, chatId) {
   if (!chatId || chatId === "default") return null;
 
@@ -499,54 +706,65 @@ async function getChatHistory(userId, chatId = "default") {
 }
 
 /* ============================================================
-   Session endpoints for sidebar
+   PROTECTED CHAT ENDPOINTS
    ============================================================ */
 
-// Create new session
-app.post("/chat/new", async (req, res) => {
-  const { userId, title } = req.body;
-  if (!userId || typeof userId !== "string" || userId.length > 200) {
-    return res.status(400).json({ error: "Invalid userId" });
-  }
+// Create new session (protected)
+app.post("/chat/new", authMiddleware, async (req, res) => {
+  const { title } = req.body;
+  const userId = req.userId;
 
   const session = await createSession(userId, title || "New chat");
   res.json(session);
 });
 
-// List sessions
-app.get("/chats/:userId", async (req, res) => {
+// List sessions (protected)
+app.get("/chats/:userId", authMiddleware, async (req, res) => {
   const { userId } = req.params;
-  if (!userId || userId.length > 200)
-    return res.status(400).json({ error: "Invalid userId" });
+  
+  // Verify user can only access their own data
+  if (userId !== req.userId) {
+    return res.status(403).json({ error: "Access denied" });
+  }
 
   const sessions = await listSessions(userId);
   res.json({ sessions });
 });
 
-// Get one session messages
-app.get("/chat/:userId/:chatId", async (req, res) => {
+// Get one session messages (protected)
+app.get("/chat/:userId/:chatId", authMiddleware, async (req, res) => {
   const { userId, chatId } = req.params;
-  if (!userId || userId.length > 200)
-    return res.status(400).json({ error: "Invalid userId" });
+  
+  // Verify user can only access their own data
+  if (userId !== req.userId) {
+    return res.status(403).json({ error: "Access denied" });
+  }
 
   const messages = await getChatHistory(userId, chatId);
   res.json({ chatId, messages });
 });
 
-// Delete one session
-app.delete("/chat/:userId/:chatId", async (req, res) => {
+// Delete one session (protected)
+app.delete("/chat/:userId/:chatId", authMiddleware, async (req, res) => {
   const { userId, chatId } = req.params;
-  if (!userId || userId.length > 200)
-    return res.status(400).json({ error: "Invalid userId" });
+  
+  // Verify user can only access their own data
+  if (userId !== req.userId) {
+    return res.status(403).json({ error: "Access denied" });
+  }
 
   await deleteSession(userId, chatId);
   res.json({ ok: true });
 });
-// Delete ALL chat sessions for a user
-app.delete("/chats/:userId", async (req, res) => {
+
+// Delete ALL chat sessions for a user (protected)
+app.delete("/chats/:userId", authMiddleware, async (req, res) => {
   const { userId } = req.params;
-  if (!userId || userId.length > 200)
-    return res.status(400).json({ error: "Invalid userId" });
+  
+  // Verify user can only access their own data
+  if (userId !== req.userId) {
+    return res.status(403).json({ error: "Access denied" });
+  }
 
   try {
     const sessions = await listSessions(userId);
@@ -569,7 +787,7 @@ app.delete("/chats/:userId", async (req, res) => {
 });
 
 /* ============================================================
-   Memory query handler (same as your original)
+   Memory query handler
    ============================================================ */
 
 function handleMemoryQuery(message, memory, userId) {
@@ -681,16 +899,14 @@ function handleMemoryQuery(message, memory, userId) {
 }
 
 /* ============================================================
-   Chat endpoint (uses memory engine + sessions)
+   Main chat endpoint (protected)
    ============================================================ */
 
-app.post("/chat", chatLimiter, async (req, res) => {
-  const { userId, message, chatId } = req.body;
+app.post("/chat", authMiddleware, chatLimiter, async (req, res) => {
+  const { message, chatId } = req.body;
+  const userId = req.userId;
   const activeChatId = chatId || "default";
 
-  if (!userId || typeof userId !== "string" || userId.length > 200) {
-    return res.status(400).json({ error: "Invalid userId" });
-  }
   if (!message || typeof message !== "string" || message.trim().length === 0) {
     return res.status(400).json({ error: "Message cannot be empty" });
   }
@@ -703,7 +919,7 @@ app.post("/chat", chatLimiter, async (req, res) => {
       "chatId:",
       activeChatId,
       ":",
-      sanitizedMessage,
+      sanitizedMessage.slice(0, 50),
     );
 
     // Ensure session exists if chatId is provided
@@ -840,13 +1056,16 @@ Current time: ${new Date().toLocaleString()}
 });
 
 /* ============================================================
-   Memory endpoints
+   Memory endpoints (protected)
    ============================================================ */
 
-app.get("/memory/:userId", async (req, res) => {
+app.get("/memory/:userId", authMiddleware, async (req, res) => {
   const { userId } = req.params;
-  if (!userId || userId.length > 200)
-    return res.status(400).json({ error: "Invalid userId" });
+  
+  // Verify user can only access their own data
+  if (userId !== req.userId) {
+    return res.status(403).json({ error: "Access denied" });
+  }
 
   try {
     const [memory, defaultChatHistory, sessions] = await Promise.all([
@@ -875,10 +1094,13 @@ app.get("/memory/:userId", async (req, res) => {
   }
 });
 
-app.delete("/memory/:userId", async (req, res) => {
+app.delete("/memory/:userId", authMiddleware, async (req, res) => {
   const { userId } = req.params;
-  if (!userId || userId.length > 200)
-    return res.status(400).json({ error: "Invalid userId" });
+  
+  // Verify user can only access their own data
+  if (userId !== req.userId) {
+    return res.status(403).json({ error: "Access denied" });
+  }
 
   try {
     await Promise.all([
@@ -905,13 +1127,13 @@ app.delete("/memory/:userId", async (req, res) => {
 });
 
 /* ============================================================
-   /stats endpoint
+   Public stats endpoint
    ============================================================ */
 
 app.get("/stats", async (req, res) => {
   try {
     const allKeys = await db.list();
-    const userKeys = allKeys.filter((k) => k.startsWith("memory_"));
+    const userKeys = allKeys.filter((k) => k.startsWith("auth_user_"));
     res.json({
       totalUsers: userKeys.length,
       serverUptime: process.uptime(),
@@ -929,20 +1151,31 @@ app.get("/stats", async (req, res) => {
 
 app.get("/", (req, res) => {
   res.json({
-    status: "✅ Genie backend (memory v3 + sessions) is live!",
+    status: "✅ Genie backend (with authentication) is live!",
     timestamp: new Date().toISOString(),
-    version: "3.1.0",
+    version: "4.0.0",
+    features: ["Authentication", "Memory Engine v3", "Chat Sessions"],
+  });
+});
+
+app.get("/api/health", (req, res) => {
+  res.json({
+    status: "healthy",
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime()
   });
 });
 
 app.listen(PORT, () => {
   console.log(`
-✅ Genie backend running with SMART MEMORY ENGINE v3 + SESSIONS!
+✅ Genie backend with AUTHENTICATION running!
 📍 Port: ${PORT}
 🔐 API Key: ${process.env.OPENROUTER_API_KEY ? "Loaded" : "Missing!"}
+🔑 JWT Secret: ${JWT_SECRET ? "Loaded" : "Using default"}
 💾 Memory: Enabled (Safe & categorized)
 🧾 Sessions: Enabled (history sidebar ready)
-🛡️ Rate Limit: 10 requests/minute
+👤 Auth: Enabled (Register/Login/JWT)
+🛡️ Rate Limit: 10 requests/minute for chat
   `);
 });
 
@@ -954,4 +1187,4 @@ process.on("SIGINT", () => {
 process.on("SIGTERM", () => {
   console.log("\n🛑 Terminated");
   process.exit(0);
-}); 
+});
