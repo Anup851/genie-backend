@@ -1,5 +1,26 @@
 // server.js
 // Genie Backend - Memory Engine v3 + Chat Sessions (History Sidebar Ready)
+import { createClient } from "@supabase/supabase-js";
+
+const supaPublic = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_ANON_KEY
+);
+
+const supaAdmin = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
+async function requireAuth(req,res,next){
+  const header = req.headers.authorization || "";
+  const token = header.replace("Bearer ","");
+
+  const { data } = await supaPublic.auth.getUser(token);
+  if(!data?.user) return res.status(401).json({error:"login required"});
+
+  req.user = data.user;
+  next();
+}
 
 import Database from "@replit/database";
 import express from "express";
