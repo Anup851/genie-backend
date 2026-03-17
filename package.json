@@ -21,6 +21,7 @@
   "author": "Anup Singh",
   "license": "ISC",
   "dependencies": {
+    "@langchain/core": "^0.3.0",
     "@replit/database": "^3.0.1",
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
@@ -28,6 +29,7 @@
     "express": "^4.19.2",
     "express-rate-limit": "^7.3.0",
     "jsonwebtoken": "^9.0.2",
+    "langchain": "^0.3.0",
     "node-fetch": "^3.3.2"
   }
 }

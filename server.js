@@ -3,12 +3,14 @@
 
 import Database from "@replit/database";
 import express from "express";
-import fetch from "node-fetch";
 import cors from "cors";
 import dotenv from "dotenv";
 import rateLimit from "express-rate-limit";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import { createChatService } from "./services/chatService.js";
+import { createHistoryService } from "./services/historyService.js";
+import { createSarvamService } from "./services/sarvamService.js";
 
 dotenv.config();
 
@@ -18,8 +20,8 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // --- Check API Key ---
-if (!process.env.OPENROUTER_API_KEY) {
-  console.error("❌ OPENROUTER_API_KEY is missing in .env!");
+if (!process.env.SARVAM_API_KEY) {
+  console.error("❌ SARVAM_API_KEY is missing in .env!");
   process.exit(1);
 }
 
@@ -705,6 +707,26 @@ async function getChatHistory(userId, chatId = "default") {
   }
 }
 
+const modularHistoryService = createHistoryService({
+  db,
+  unwrapDbData,
+  config: {
+    maxSessions: MAX_SESSIONS,
+    maxHistoryLength: MAX_HISTORY_LENGTH,
+    maxMessageLength: MAX_MESSAGE_LENGTH,
+  },
+});
+
+const sarvamService = createSarvamService({
+  apiKey: process.env.SARVAM_API_KEY,
+});
+
+const chatService = createChatService({
+  historyService: modularHistoryService,
+  sarvamService,
+  retrieveRelevantMemorySnippet,
+});
+
 /* ============================================================
    PROTECTED CHAT ENDPOINTS
    ============================================================ */
@@ -966,81 +988,20 @@ app.post("/chat", authMiddleware, chatLimiter, async (req, res) => {
       return res.json({ reply: memoryQueryReply });
     }
 
-    // 3) Use relevant memory snippet + history per chatId
-    const memoryContext = await retrieveRelevantMemorySnippet(
-      userId,
-      sanitizedMessage,
-    );
-
-    const systemPrompt = {
-      role: "system",
-      content: `You are Genie, a friendly assistant. Use the memory below to personalize replies when helpful.
-
-Memory snippet:
-${memoryContext}
-
-Guidelines:
-1. Be natural, conversational and helpful.
-2. Use the memory above to personalize if appropriate.
-3. Keep responses concise (under 500 tokens).
-Current time: ${new Date().toLocaleString()}
-      `,
-    };
-
-    const history = await getChatHistory(userId, activeChatId);
-    const messagesForAI = [
-      systemPrompt,
-      ...history.slice(-8).map((h) => ({ role: h.role, content: h.message })),
-      { role: "user", content: sanitizedMessage },
-    ];
-
+    // 3) Normal chat path now uses LangChain prompt orchestration + Sarvam backend
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 30000);
+    const timeout = setTimeout(() => controller.abort(), 45000);
 
-    const response = await fetch(
-      "https://openrouter.ai/api/v1/chat/completions",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-          "HTTP-Referer": process.env.SITE_URL || "https://yourdomain.com",
-          "X-Title": "Genie Chatbot",
-        },
-        body: JSON.stringify({
-          model: "openai/gpt-3.5-turbo-16k",
-          messages: messagesForAI,
-          max_tokens: 500,
-          temperature: 0.7,
-        }),
-
-        signal: controller.signal,
-      },
-    );
+    const result = await chatService.handleChat({
+      userId,
+      message: sanitizedMessage,
+      chatId: activeChatId,
+      signal: controller.signal,
+    });
 
     clearTimeout(timeout);
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error("OpenRouter error:", response.status, errorText);
-
-      return res.status(response.status).json({
-        error: "AI service error",
-        status: response.status,
-        details: errorText,
-      });
-    }
-
-    const data = await response.json();
-    const reply =
-      data.choices?.[0]?.message?.content ??
-      "Sorry, I couldn't generate a reply. Try rephrasing.";
-
-    await saveMessage(userId, "user", sanitizedMessage, activeChatId);
-    await saveMessage(userId, "assistant", reply, activeChatId);
-    await touchSession(userId, activeChatId, titleCandidate);
-
-    res.json({ reply, usage: data.usage ?? null });
+    res.json(result);
   } catch (err) {
     console.error("❌ /chat error:", err);
     if (err.name === "AbortError") {
@@ -1170,7 +1131,7 @@ app.listen(PORT, () => {
   console.log(`
 ✅ Genie backend with AUTHENTICATION running!
 📍 Port: ${PORT}
-🔐 API Key: ${process.env.OPENROUTER_API_KEY ? "Loaded" : "Missing!"}
+🔐 SARVAM_API_KEY: ${process.env.SARVAM_API_KEY ? "Loaded" : "Missing!"}
 🔑 JWT Secret: ${JWT_SECRET ? "Loaded" : "Using default"}
 💾 Memory: Enabled (Safe & categorized)
 🧾 Sessions: Enabled (history sidebar ready)
