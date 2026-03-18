@@ -2,12 +2,12 @@ import fs from "fs/promises";
 import path from "path";
 import Database from "@replit/database";
 
-function deepClone(value) {
+function cloneValue(value) {
   if (value === undefined) return null;
   return JSON.parse(JSON.stringify(value));
 }
 
-class FileStore {
+class FileBackedStore {
   constructor(filePath) {
     this.filePath = filePath;
     this.state = {};
@@ -20,9 +20,9 @@ class FileStore {
       const raw = await fs.readFile(this.filePath, "utf8");
       const parsed = JSON.parse(raw);
       this.state = parsed && typeof parsed === "object" ? parsed : {};
-    } catch (error) {
-      if (error.code !== "ENOENT") {
-        console.warn("[DB] Failed to read local data store:", error.message);
+    } catch (err) {
+      if (err.code !== "ENOENT") {
+        console.warn("[DB] Failed to read local store, starting empty:", err.message);
       }
       this.state = {};
       await this.flush();
@@ -39,12 +39,12 @@ class FileStore {
 
   async get(key) {
     await this.ready;
-    return deepClone(this.state[key] ?? null);
+    return cloneValue(this.state[key] ?? null);
   }
 
   async set(key, value) {
     await this.ready;
-    this.state[key] = deepClone(value);
+    this.state[key] = cloneValue(value);
     await this.flush();
     return this.get(key);
   }
@@ -66,15 +66,16 @@ export function createKeyValueStore() {
     return new Database(dbUrl);
   }
 
-  const filePath = path.resolve(
+  const dataFile = path.resolve(
     process.cwd(),
     process.env.LOCAL_DB_FILE || "data/render-db.json",
   );
   console.warn(
-    `[DB] REPLIT_DB_URL is not set. Falling back to local file store at ${filePath}`,
+    `[DB] REPLIT_DB_URL is not set. Falling back to local file store at ${dataFile}`,
   );
   console.warn(
-    "[DB] Local Render storage is ephemeral unless a persistent disk is attached.",
+    "[DB] Render disks are ephemeral unless you attach a persistent disk. Chat history and local auth users may reset on redeploy.",
   );
-  return new FileStore(filePath);
+  return new FileBackedStore(dataFile);
 }
+

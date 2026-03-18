@@ -21,11 +21,18 @@ function sanitizeInput(text, maxMessageLength) {
 }
 
 export function createHistoryService({ db, unwrapDbData, config }) {
-  const { maxSessions, maxHistoryLength, maxMessageLength } = config;
+  const {
+    maxSessions,
+    maxHistoryLength,
+    maxMessageLength,
+    autoCleanThreshold = maxHistoryLength,
+    cleanKeepRecent = Math.max(10, Math.floor(maxHistoryLength / 3)),
+  } = config;
+  const unwrap = typeof unwrapDbData === "function" ? unwrapDbData : (value) => value;
 
   async function listSessions(userId) {
     const raw = await db.get(createSessionsKey(userId));
-    const sessions = unwrapDbData(raw);
+    const sessions = unwrap(raw);
     return Array.isArray(sessions) ? sessions : [];
   }
 
@@ -107,7 +114,8 @@ export function createHistoryService({ db, unwrapDbData, config }) {
           : createSessionMessagesKey(userId, chatId);
 
       const raw = await db.get(key);
-      const history = Array.isArray(unwrapDbData(raw)) ? unwrapDbData(raw) : [];
+      const unwrapped = unwrap(raw);
+      const history = Array.isArray(unwrapped) ? unwrapped : [];
       history.push({ role, message: sanitizedMessage, timestamp: Date.now() });
 
       if (history.length > maxHistoryLength) {
@@ -129,7 +137,7 @@ export function createHistoryService({ db, unwrapDbData, config }) {
           ? `chat_${userId}`
           : createSessionMessagesKey(userId, chatId);
       const raw = await db.get(key);
-      const history = unwrapDbData(raw);
+      const history = unwrap(raw);
       return Array.isArray(history) ? history : [];
     } catch (err) {
       console.error("getChatHistory error:", err);
@@ -137,10 +145,40 @@ export function createHistoryService({ db, unwrapDbData, config }) {
     }
   }
 
+  async function forceCleanChat(userId, chatId = "default") {
+    const key =
+      chatId === "default"
+        ? `chat_${userId}`
+        : createSessionMessagesKey(userId, chatId);
+    const history = await getChatHistory(userId, chatId);
+
+    const deduped = [];
+    for (const item of history) {
+      const last = deduped[deduped.length - 1];
+      if (
+        last &&
+        last.role === item.role &&
+        last.message === item.message
+      ) {
+        continue;
+      }
+      deduped.push(item);
+    }
+
+    const cleaned =
+      deduped.length > autoCleanThreshold
+        ? deduped.slice(-cleanKeepRecent)
+        : deduped;
+
+    await db.set(key, cleaned);
+    return cleaned;
+  }
+
   return {
     createSession,
     deleteSession,
     ensureSession,
+    forceCleanChat,
     getChatHistory,
     listSessions,
     saveMessage,
@@ -148,5 +186,6 @@ export function createHistoryService({ db, unwrapDbData, config }) {
     sessionMessagesKey: createSessionMessagesKey,
     sessionsKey: createSessionsKey,
     touchSession,
+    unwrapDbData: unwrap,
   };
 }

@@ -1,82 +1,88 @@
 import { AIMessage, HumanMessage } from "@langchain/core/messages";
-import {
-  ChatPromptTemplate,
-  MessagesPlaceholder,
-} from "@langchain/core/prompts";
+import { ChatPromptTemplate, MessagesPlaceholder } from "@langchain/core/prompts";
 
-export function buildChatParams(message) {
+export function buildChatParams(message, maxResponseTokens = 4000) {
   const isCodeHeavy = isCodeHeavyMessage(message);
   return {
     isCodeHeavy,
-    maxTokens: isCodeHeavy ? 1800 : 700,
-    timeout: isCodeHeavy ? 45000 : 30000,
-    historyLimit: isCodeHeavy ? 8 : 10,
-    temperature: isCodeHeavy ? 0.25 : 0.7,
+    maxTokens: isCodeHeavy ? maxResponseTokens : 1000,
+    timeout: isCodeHeavy ? 60000 : 30000,
+    historyLimit: isCodeHeavy ? 8 : 12,
+    temperature: isCodeHeavy ? 0.25 : 0.6,
   };
 }
 
-export async function buildPromptMessages({
+export async function buildStructuredChatPrompt({
   history = [],
   userMessage,
-  memoryContext = "",
-  extraSystemContext = "",
+  nowIST,
+  newsContextBlock = "",
   optimizedParams,
 }) {
-  const prompt = ChatPromptTemplate.fromMessages([
-    ["system", "{systemInstruction}"],
-    new MessagesPlaceholder("recentChat"),
-    [
-      "human",
-      [
-        "USER QUESTION:",
-        "{userQuestion}",
-        "",
-        "INSTRUCTIONS:",
-        "- Answer clearly and directly",
-        "- Preserve code formatting when useful",
-        "- Be concise unless the user asks for detail",
-      ].join("\n"),
-    ],
-  ]);
-
-  const recentChat = history
+  const recentHistory = history
     .slice(-optimizedParams.historyLimit)
     .map(toLangChainMessage)
     .filter(Boolean);
 
-  return prompt.formatMessages({
-    systemInstruction: buildSystemInstruction({
-      isCodeHeavy: optimizedParams.isCodeHeavy,
-      memoryContext,
-      extraSystemContext,
-    }),
-    recentChat,
-    userQuestion: String(userMessage || "").trim(),
+  const systemText = buildSystemInstruction({
+    isCodeHeavy: optimizedParams.isCodeHeavy,
+    nowIST,
   });
+
+  const userText = buildUserPrompt(userMessage, newsContextBlock);
+
+  // LangChain stays in the orchestration layer for prompt/history preparation,
+  // while the final Sarvam call still receives plain provider-native messages.
+  const prompt = ChatPromptTemplate.fromMessages([
+    ["system", "{systemInstruction}"],
+    new MessagesPlaceholder("recentChat"),
+    ["human", "{userQuestion}"],
+  ]);
+
+  const langChainMessages = await prompt.formatMessages({
+    systemInstruction: systemText,
+    recentChat: recentHistory,
+    userQuestion: userText,
+  });
+
+  return {
+    systemText,
+    userText,
+    historyMessages: recentHistory.map((message) => ({
+      role: message instanceof AIMessage ? "assistant" : "user",
+      content: getMessageContent(message.content),
+    })),
+    langChainMessages,
+  };
 }
 
-function buildSystemInstruction({
-  isCodeHeavy = false,
-  memoryContext = "",
-  extraSystemContext = "",
-}) {
+function buildSystemInstruction({ isCodeHeavy = false, nowIST = "" }) {
   const codingMode = isCodeHeavy
     ? "When coding is requested, provide complete runnable code with exact file names and minimal required steps."
     : "When coding is requested, provide practical snippets and avoid unnecessary verbosity.";
 
   return [
-    "You are Genie, a friendly assistant.",
-    "Use remembered user details only when they are relevant and helpful.",
-    "Be natural, accurate, and easy to understand.",
+    "You are Genie, a reliable AI assistant for practical help.",
+    "Reply in the same language as the user's latest message unless the user asks for another language.",
+    "Be clear, direct, and helpful. Avoid filler and repetition.",
     codingMode,
-    "For any multi-line code, always use fenced markdown code blocks with a language tag when known.",
+    "For any multi-line code, always use fenced markdown code blocks with triple backticks and a language tag when known.",
     "Do not leave code fences unclosed.",
-    "Always format inline code with backticks when useful.",
-    memoryContext ? `Memory snippet:\n${memoryContext}` : "",
-    extraSystemContext || "",
+    "Never output placeholder tokens like @@INLINECODE0@@ or @@INLINE_CODE_0@@.",
+    "Always format inline code with backticks.",
+    "If information is uncertain, state assumptions briefly instead of guessing facts.",
+    nowIST
+      ? `Current date/time is: ${nowIST}. If the user asks for time, date, or day, use this exact server time.`
+      : "",
+    "If NEWS_RESULTS is present, use only NEWS_RESULTS for current events. If it is empty, say you do not have live news results.",
   ]
     .filter(Boolean)
     .join("\n\n");
+}
+
+function buildUserPrompt(userMessage, newsContextBlock) {
+  if (!newsContextBlock) return String(userMessage || "").trim();
+  return `${newsContextBlock}\n\nUSER_MESSAGE:\n${String(userMessage || "").trim()}`;
 }
 
 function toLangChainMessage(message) {
@@ -86,6 +92,20 @@ function toLangChainMessage(message) {
   if (message.role === "assistant") return new AIMessage(content);
   if (message.role === "user") return new HumanMessage(content);
   return null;
+}
+
+function getMessageContent(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (typeof part === "string") return part;
+        if (typeof part?.text === "string") return part.text;
+        return "";
+      })
+      .join("");
+  }
+  return "";
 }
 
 function isCodeHeavyMessage(message) {
