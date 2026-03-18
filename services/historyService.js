@@ -117,7 +117,9 @@ export function createHistoryService({ supabase, config }) {
     const existing = await fetchSessionById(userId, chatId);
     if (existing) return existing;
 
-    if (!isUuid(chatId)) return null;
+    if (!isUuid(chatId)) {
+      return createSession(userId, "New chat");
+    }
 
     const { data, error } = await supabase
       .from("chat_sessions")
@@ -243,7 +245,7 @@ export function createHistoryService({ supabase, config }) {
   async function getChatHistory(userId, chatId = "default") {
     try {
       let sessionId = chatId;
-      if (!sessionId || sessionId === "default") {
+      if (!sessionId || sessionId === "default" || !isUuid(sessionId)) {
         const latest = await fetchLatestSession(userId);
         sessionId = latest?.chatId || null;
       }
