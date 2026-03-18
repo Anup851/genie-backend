@@ -601,6 +601,8 @@ async function retrieveRelevantMemorySnippet(userId, message) {
 const MAX_SESSIONS = 50;
 const MAX_HISTORY_LENGTH = 80; // per chat session
 const MAX_MESSAGE_LENGTH = 2000;
+const MAX_RESPONSE_TOKENS = 4000;
+const SESSION_LIMIT_WARNING = 100;
 
 function sanitizeInput(text) {
   if (typeof text !== "string") return "";
@@ -755,7 +757,10 @@ const sarvamService = createSarvamService({
 const chatService = createChatService({
   historyService: modularHistoryService,
   sarvamService,
-  retrieveRelevantMemorySnippet,
+  config: {
+    maxResponseTokens: MAX_RESPONSE_TOKENS,
+    sessionLimitWarning: SESSION_LIMIT_WARNING,
+  },
 });
 
 /* ============================================================
