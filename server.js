@@ -24,7 +24,18 @@ const SUPABASE_URL =
 const SUPABASE_ANON_KEY =
   process.env.SUPABASE_ANON_KEY ||
   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5pa3p5cHBrd2VkbXpsZGdocmdoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njk0OTU1NzQsImV4cCI6MjA4NTA3MTU3NH0.ssb4-8V0wkkxyfDQSzfzgTrTbjxDu1OWyjogzJlupYM";
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+const SUPABASE_SERVICE_ROLE_KEY =
+  process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+
+const supabase = createClient(
+  SUPABASE_URL,
+  SUPABASE_SERVICE_ROLE_KEY || SUPABASE_ANON_KEY,
+  {
+    auth: { persistSession: false, autoRefreshToken: false },
+  },
+);
+
+const supabaseAuthClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
 });
 
@@ -32,6 +43,12 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
 if (!process.env.SARVAM_API_KEY) {
   console.error("❌ SARVAM_API_KEY is missing in .env!");
   process.exit(1);
+}
+
+if (!SUPABASE_SERVICE_ROLE_KEY) {
+  console.warn(
+    "[SUPABASE] SUPABASE_SERVICE_ROLE_KEY is missing. RLS-protected writes may fail.",
+  );
 }
 
 // JWT Secret
@@ -94,7 +111,7 @@ const authMiddleware = async (req, res, next) => {
     }
 
     try {
-        const { data, error } = await supabase.auth.getUser(token);
+        const { data, error } = await supabaseAuthClient.auth.getUser(token);
         if (!error && data?.user?.id) {
             req.user = {
                 id: data.user.id,
@@ -1112,4 +1129,5 @@ process.on("SIGTERM", () => {
   console.log("\n🛑 Terminated");
   process.exit(0);
 });
+
 
