@@ -1,7 +1,6 @@
 // server.js
 // Genie Backend - Memory Engine v3 + Chat Sessions + Authentication
 
-import Database from "@replit/database";
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -9,13 +8,14 @@ import rateLimit from "express-rate-limit";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { createChatService } from "./services/chatService.js";
+import { createKeyValueStore } from "./services/dataStore.js";
 import { createHistoryService } from "./services/historyService.js";
 import { createSarvamService } from "./services/sarvamService.js";
 
 dotenv.config();
 
 // --- Initialize ---
-const db = new Database();
+const db = createKeyValueStore();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
