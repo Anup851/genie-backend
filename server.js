@@ -763,6 +763,35 @@ app.delete("/chat/:userId/:chatId", authMiddleware, async (req, res) => {
   res.json({ ok: true });
 });
 
+app.put("/chat/:userId/:chatId/title", authMiddleware, async (req, res) => {
+  const { userId, chatId } = req.params;
+  const title = String(req.body?.title || "").trim().slice(0, 60);
+
+  if (userId !== req.userId) {
+    return res.status(403).json({ error: "Access denied" });
+  }
+  if (!title) {
+    return res.status(400).json({ error: "Invalid title" });
+  }
+
+  try {
+    const session = await modularHistoryService.updateSessionTitle(
+      userId,
+      chatId,
+      title,
+    );
+
+    if (!session) {
+      return res.status(404).json({ error: "Chat not found" });
+    }
+
+    return res.json({ success: true, chatId: session.chatId, title: session.title });
+  } catch (error) {
+    console.error("❌ Error updating chat title:", error);
+    return res.status(500).json({ error: "Failed to update title" });
+  }
+});
+
 // Delete ALL chat sessions for a user (protected)
 app.delete("/chats/:userId", authMiddleware, async (req, res) => {
   const { userId } = req.params;

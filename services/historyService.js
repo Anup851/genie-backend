@@ -173,6 +173,32 @@ export function createHistoryService({ supabase, config }) {
     };
   }
 
+  async function updateSessionTitle(userId, chatId, title) {
+    if (!chatId || !isUuid(chatId)) return null;
+    const safeTitle = sanitizeInput(title, 120);
+    if (!safeTitle) return null;
+
+    const { data, error } = await supabase
+      .from("chat_sessions")
+      .update({
+        title: safeTitle,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("user_id", userId)
+      .eq("id", chatId)
+      .select("id, title, created_at, updated_at")
+      .single();
+
+    if (error) throw error;
+
+    return {
+      chatId: data.id,
+      title: data.title || "New chat",
+      createdAt: new Date(data.created_at).getTime(),
+      updatedAt: new Date(data.updated_at).getTime(),
+    };
+  }
+
   async function deleteSession(userId, chatId) {
     if (!chatId || !isUuid(chatId)) return;
     const { error } = await supabase
@@ -331,6 +357,7 @@ export function createHistoryService({ supabase, config }) {
     sessionMessagesKey: (_userId, chatId) => chatId,
     sessionsKey: (userId) => userId,
     touchSession,
+    updateSessionTitle,
     unwrapDbData: (value) => value,
   };
 }
