@@ -7,6 +7,7 @@ import dotenv from "dotenv";
 import rateLimit from "express-rate-limit";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import { createClient } from "@supabase/supabase-js";
 import { createChatService } from "./services/chatService.js";
 import { createKeyValueStore } from "./services/dataStore.js";
 import { createHistoryService } from "./services/historyService.js";
@@ -18,6 +19,14 @@ dotenv.config();
 const db = createKeyValueStore();
 const app = express();
 const PORT = process.env.PORT || 3000;
+const SUPABASE_URL =
+  process.env.SUPABASE_URL || "https://nikzyppkwedmzldghrgh.supabase.co";
+const SUPABASE_ANON_KEY =
+  process.env.SUPABASE_ANON_KEY ||
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5pa3p5cHBrd2VkbXpsZGdocmdoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njk0OTU1NzQsImV4cCI6MjA4NTA3MTU3NH0.ssb4-8V0wkkxyfDQSzfzgTrTbjxDu1OWyjogzJlupYM";
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+  auth: { persistSession: false, autoRefreshToken: false },
+});
 
 // --- Check API Key ---
 if (!process.env.SARVAM_API_KEY) {
@@ -78,35 +87,48 @@ app.use((req, res, next) => {
 
 // Auth middleware
 const authMiddleware = async (req, res, next) => {
+    const token = req.header("Authorization")?.replace("Bearer ", "").trim();
+
+    if (!token) {
+        return res.status(401).json({ error: "Authentication required" });
+    }
+
     try {
-        const token = req.header('Authorization')?.replace('Bearer ', '');
-        
-        if (!token) {
-            return res.status(401).json({ error: 'Authentication required' });
+        const { data, error } = await supabase.auth.getUser(token);
+        if (!error && data?.user?.id) {
+            req.user = {
+                id: data.user.id,
+                email: data.user.email || null,
+                supabase: true,
+            };
+            req.userId = data.user.id;
+            return next();
         }
-        
+    } catch (error) {
+        console.warn("Supabase auth verification failed:", error.message);
+    }
+
+    try {
         const decoded = jwt.verify(token, JWT_SECRET);
-        
-        // Get user from database
         const userKey = `auth_user_${decoded.userId}`;
         const user = await db.get(userKey);
-        
+
         if (!user) {
-            return res.status(401).json({ error: 'User not found' });
+            return res.status(401).json({ error: "User not found" });
         }
-        
+
         req.user = user;
         req.userId = user.id;
-        next();
+        return next();
     } catch (error) {
-        console.error('Auth middleware error:', error.message);
-        if (error.name === 'JsonWebTokenError') {
-            return res.status(401).json({ error: 'Invalid token' });
+        console.error("Auth middleware error:", error.message);
+        if (error.name === "JsonWebTokenError") {
+            return res.status(401).json({ error: "Invalid token" });
         }
-        if (error.name === 'TokenExpiredError') {
-            return res.status(401).json({ error: 'Token expired' });
+        if (error.name === "TokenExpiredError") {
+            return res.status(401).json({ error: "Token expired" });
         }
-        res.status(401).json({ error: 'Please authenticate' });
+        return res.status(401).json({ error: "Please authenticate" });
     }
 };
 
@@ -260,6 +282,15 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
 // Get current user
 app.get('/api/auth/me', authMiddleware, async (req, res) => {
     try {
+        if (req.user?.supabase) {
+            return res.json({
+                success: true,
+                user: {
+                    id: req.user.id,
+                    email: req.user.email,
+                },
+            });
+        }
         const { password: _, ...userWithoutPassword } = req.user;
         res.json({
             success: true,
