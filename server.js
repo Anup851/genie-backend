@@ -518,56 +518,72 @@ function extractMemory(userMessage) {
 
 async function saveUserMemoryBatch(userId, memories) {
   if (!userId || !memories || Object.keys(memories).length === 0) return null;
-  const memoryKey = `memory_${userId}`;
 
   try {
-    const raw = await db.get(memoryKey);
-    const existing = unwrapDbData(raw) || {};
+    const rows = Object.entries(memories).map(([memoryKey, item]) => ({
+      user_id: userId,
+      category: item.category,
+      memory_key: memoryKey,
+      value: item.value,
+      updated_at: new Date().toISOString(),
+    }));
 
-    for (const cat of Object.keys(MEMORY_CATEGORIES)) {
-      if (!existing[cat]) existing[cat] = {};
-    }
+    const { error } = await supabase
+      .from("user_memory")
+      .upsert(rows, { onConflict: "user_id,category,memory_key" });
 
-    for (const [k, v] of Object.entries(memories)) {
-      existing[v.category] = existing[v.category] || {};
-      existing[v.category][k] = {
-        value: v.value,
-        savedAt: Date.now(),
-        lastAccessed: Date.now(),
-      };
-    }
-
-    await db.set(memoryKey, existing);
-    return existing;
+    if (error) throw error;
+    return await getUserMemory(userId);
   } catch (err) {
-    console.error("❌ saveUserMemoryBatch error:", err);
-    await db.set(memoryKey, memories);
+    console.error("saveUserMemoryBatch error:", err);
     return memories;
   }
 }
 
 async function getUserMemory(userId) {
   try {
-    const raw = await db.get(`memory_${userId}`);
-    const memory = unwrapDbData(raw) || {};
+    const { data, error } = await supabase
+      .from("user_memory")
+      .select("category, memory_key, value, created_at, updated_at")
+      .eq("user_id", userId)
+      .order("updated_at", { ascending: false });
+
+    if (error) throw error;
+
+    const memory = {};
+    for (const category of Object.keys(MEMORY_CATEGORIES)) {
+      memory[category] = {};
+    }
+
+    for (const row of data || []) {
+      memory[row.category] = memory[row.category] || {};
+      memory[row.category][row.memory_key] = {
+        value: row.value,
+        savedAt: row.created_at ? new Date(row.created_at).getTime() : Date.now(),
+        lastAccessed: row.updated_at
+          ? new Date(row.updated_at).getTime()
+          : Date.now(),
+      };
+    }
+
     return memory;
   } catch (err) {
-    console.error("❌ getUserMemory error:", err);
+    console.error("getUserMemory error:", err);
     return {};
   }
 }
 
 async function updateLastAccessed(userId, category, key) {
   try {
-    const memoryKey = `memory_${userId}`;
-    const raw = await db.get(memoryKey);
-    const memory = unwrapDbData(raw) || {};
-    if (memory[category] && memory[category][key]) {
-      memory[category][key].lastAccessed = Date.now();
-      await db.set(memoryKey, memory);
-    }
+    const { error } = await supabase
+      .from("user_memory")
+      .update({ updated_at: new Date().toISOString() })
+      .eq("user_id", userId)
+      .eq("category", category)
+      .eq("memory_key", key);
+    if (error) throw error;
   } catch (err) {
-    console.error("❌ updateLastAccessed error:", err);
+    console.error("updateLastAccessed error:", err);
   }
 }
 
@@ -625,124 +641,39 @@ function makeChatId() {
 }
 
 async function listSessions(userId) {
-  const raw = await db.get(sessionsKey(userId));
-  const sessions = unwrapDbData(raw);
-  return Array.isArray(sessions) ? sessions : [];
+  return modularHistoryService.listSessions(userId);
 }
 
 async function saveSessions(userId, sessions) {
-  await db.set(sessionsKey(userId), sessions.slice(0, MAX_SESSIONS));
+  return modularHistoryService.saveSessions(userId, sessions);
 }
 
 async function createSession(userId, title = "New chat") {
-  const sessions = await listSessions(userId);
-  const chatId = makeChatId();
-
-  const session = {
-    chatId,
-    title,
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-  };
-
-  sessions.unshift(session);
-  await saveSessions(userId, sessions);
-  await db.set(sessionMessagesKey(userId, chatId), []);
-
-  return session;
+  return modularHistoryService.createSession(userId, title);
 }
 
 async function ensureSession(userId, chatId) {
-  if (!chatId || chatId === "default") return null;
-
-  const sessions = await listSessions(userId);
-  const existing = sessions.find((s) => s.chatId === chatId);
-  if (existing) return existing;
-
-  const session = {
-    chatId,
-    title: "New chat",
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-  };
-  sessions.unshift(session);
-  await saveSessions(userId, sessions);
-  await db.set(sessionMessagesKey(userId, chatId), []);
-  return session;
+  return modularHistoryService.ensureSession(userId, chatId);
 }
 
 async function touchSession(userId, chatId, titleIfEmpty) {
-  if (!chatId || chatId === "default") return null;
-  const sessions = await listSessions(userId);
-  const idx = sessions.findIndex((s) => s.chatId === chatId);
-  if (idx === -1) return null;
-
-  sessions[idx].updatedAt = Date.now();
-  if (
-    titleIfEmpty &&
-    (!sessions[idx].title || sessions[idx].title === "New chat")
-  ) {
-    sessions[idx].title = titleIfEmpty;
-  }
-
-  // move to top
-  const [s] = sessions.splice(idx, 1);
-  sessions.unshift(s);
-
-  await saveSessions(userId, sessions);
-  return s;
+  return modularHistoryService.touchSession(userId, chatId, titleIfEmpty);
 }
 
 async function deleteSession(userId, chatId) {
-  const sessions = await listSessions(userId);
-  const filtered = sessions.filter((s) => s.chatId !== chatId);
-  await saveSessions(userId, filtered);
-  await db.delete(sessionMessagesKey(userId, chatId));
+  return modularHistoryService.deleteSession(userId, chatId);
 }
 
 async function saveMessage(userId, role, message, chatId = "default") {
-  try {
-    const sanitizedMessage = sanitizeInput(message);
-    const key =
-      chatId === "default"
-        ? `chat_${userId}`
-        : sessionMessagesKey(userId, chatId);
-
-    const raw = await db.get(key);
-    const history = Array.isArray(unwrapDbData(raw)) ? unwrapDbData(raw) : [];
-
-    history.push({ role, message: sanitizedMessage, timestamp: Date.now() });
-
-    if (history.length > MAX_HISTORY_LENGTH) {
-      history.splice(0, history.length - MAX_HISTORY_LENGTH);
-    }
-
-    await db.set(key, history);
-    return history;
-  } catch (err) {
-    console.error("❌ saveMessage error:", err);
-    return null;
-  }
+  return modularHistoryService.saveMessage(userId, role, message, chatId);
 }
 
 async function getChatHistory(userId, chatId = "default") {
-  try {
-    const key =
-      chatId === "default"
-        ? `chat_${userId}`
-        : sessionMessagesKey(userId, chatId);
-    const raw = await db.get(key);
-    const history = unwrapDbData(raw);
-    return Array.isArray(history) ? history : [];
-  } catch (err) {
-    console.error("❌ getChatHistory error:", err);
-    return [];
-  }
+  return modularHistoryService.getChatHistory(userId, chatId);
 }
 
 const modularHistoryService = createHistoryService({
-  db,
-  unwrapDbData,
+  supabase,
   config: {
     maxSessions: MAX_SESSIONS,
     maxHistoryLength: MAX_HISTORY_LENGTH,
@@ -826,16 +757,9 @@ app.delete("/chats/:userId", authMiddleware, async (req, res) => {
 
   try {
     const sessions = await listSessions(userId);
-
-    // delete all session message keys
     for (const s of sessions) {
-      try {
-        await db.delete(sessionMessagesKey(userId, s.chatId));
-      } catch {}
+      await deleteSession(userId, s.chatId);
     }
-
-    // clear sessions list
-    await db.set(sessionsKey(userId), []);
 
     res.json({ ok: true, deleted: sessions.length });
   } catch (err) {
@@ -1100,18 +1024,21 @@ app.delete("/memory/:userId", authMiddleware, async (req, res) => {
   }
 
   try {
-    await Promise.all([
-      db.set(`memory_${userId}`, {}),
-      db.set(`chat_${userId}`, []), // default
-      db.set(sessionsKey(userId), []), // sessions list
-    ]);
-
-    // Also delete each session messages key (best effort)
     const sessions = await listSessions(userId);
+    const sessionIds = sessions.map((session) => session.chatId);
+
+    await supabase.from("user_memory").delete().eq("user_id", userId);
+    if (sessionIds.length) {
+      await supabase
+        .from("chat_messages")
+        .delete()
+        .eq("user_id", userId)
+        .in("session_id", sessionIds);
+    }
+    await supabase.from("chat_sessions").delete().eq("user_id", userId);
+
     for (const s of sessions) {
-      try {
-        await db.delete(sessionMessagesKey(userId, s.chatId));
-      } catch {}
+      await deleteSession(userId, s.chatId);
     }
 
     res.json({ message: "User data cleared successfully" });
@@ -1185,3 +1112,4 @@ process.on("SIGTERM", () => {
   console.log("\n🛑 Terminated");
   process.exit(0);
 });
+
