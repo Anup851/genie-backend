@@ -1,84 +1,76 @@
-// server.js
-// Genie Backend - Memory Engine v3 + Chat Sessions + Authentication
-
+﻿// server.js - Genie Backend (COMPLETE FIXED)
+import crypto from "crypto";
 import express from "express";
+import fetch from "node-fetch";
 import cors from "cors";
 import dotenv from "dotenv";
-import rateLimit from "express-rate-limit";
-import bcrypt from "bcryptjs";
-import jwt from "jsonwebtoken";
 import { createClient } from "@supabase/supabase-js";
-import { createChatService } from "./services/chatService.js";
+import { createChatService, fetchGdeltArticles } from "./services/chatService.js";
 import { createKeyValueStore } from "./services/dataStore.js";
 import { createHistoryService } from "./services/historyService.js";
 import { createSarvamService } from "./services/sarvamService.js";
+import { cleanAssistantReply } from "./utils/messageFormatter.js";
 
-dotenv.config();
+dotenv.config({ quiet: true });
 
 // --- Initialize ---
 const db = createKeyValueStore();
 const app = express();
+const GEMINI_MODEL = String(process.env.GEMINI_MODEL || "gemini-2.5-flash")
+  .trim()
+  .replace(/^models\//i, "");
+const GEMINI_MEDIA_MODEL = String(
+  process.env.GEMINI_MEDIA_MODEL || GEMINI_MODEL,
+)
+  .trim()
+  .replace(/^models\//i, "");
+const GEMINI_API_VERSION = String(
+  process.env.GEMINI_API_VERSION || "v1beta",
+).trim();
+const DEEPAI_API_BASE = "https://api.deepai.org/api";
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL =
   process.env.SUPABASE_URL || "https://nikzyppkwedmzldghrgh.supabase.co";
 const SUPABASE_ANON_KEY =
   process.env.SUPABASE_ANON_KEY ||
   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5pa3p5cHBrd2VkbXpsZGdocmdoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njk0OTU1NzQsImV4cCI6MjA4NTA3MTU3NH0.ssb4-8V0wkkxyfDQSzfzgTrTbjxDu1OWyjogzJlupYM";
-const SUPABASE_SERVICE_ROLE_KEY =
-  process.env.SUPABASE_SERVICE_ROLE_KEY || "";
-
-const supabase = createClient(
-  SUPABASE_URL,
-  SUPABASE_SERVICE_ROLE_KEY || SUPABASE_ANON_KEY,
-  {
-    auth: { persistSession: false, autoRefreshToken: false },
-  },
-);
-
-const supabaseAuthClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
 });
 
 // --- Check API Key ---
 if (!process.env.SARVAM_API_KEY) {
-  console.error("❌ SARVAM_API_KEY is missing in .env!");
+  console.error("âŒ SARVAM_API_KEY is missing in .env!");
   process.exit(1);
 }
 
-if (!SUPABASE_SERVICE_ROLE_KEY) {
-  console.warn(
-    "[SUPABASE] SUPABASE_SERVICE_ROLE_KEY is missing. RLS-protected writes may fail.",
-  );
+// --- Simple Rate Limiting ---
+const requestCounts = new Map();
+const MAX_REQUESTS_PER_MINUTE = 40;
+
+function checkRateLimit(userId) {
+  const now = Date.now();
+  const userRequests = requestCounts.get(userId) || [];
+  const recentRequests = userRequests.filter((time) => now - time < 60000);
+
+  if (recentRequests.length >= MAX_REQUESTS_PER_MINUTE) {
+    return { allowed: false, remaining: 0 };
+  }
+
+  recentRequests.push(now);
+  requestCounts.set(userId, recentRequests);
+  return {
+    allowed: true,
+    remaining: MAX_REQUESTS_PER_MINUTE - recentRequests.length,
+  };
 }
 
-// JWT Secret
-const JWT_SECRET = process.env.JWT_SECRET || 'genie-secret-key-change-in-production';
-
-// --- Rate Limiting ---
-const chatLimiter = rateLimit({
-  windowMs: 1 * 60 * 1000, // 1 minute
-  max: 10,
-  keyGenerator: (req) => req.user?.id || req.body?.userId || "anonymous",
-  skip: (req) => req.method === "OPTIONS",
-  message: { error: "Too many requests. Please wait a moment." },
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 20,
-  message: { error: "Too many authentication attempts. Please try again later." },
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-
 // --- Middleware ---
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json({ limit: "20mb" }));
 app.use(express.urlencoded({ extended: true }));
 app.use(cors());
 
-// --- Manual CORS for safety (keeps preflight) ---
+// --- CORS Headers ---
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
@@ -86,615 +78,32 @@ app.use((req, res, next) => {
     "Access-Control-Allow-Headers",
     "Content-Type, Authorization, X-Requested-With",
   );
+  res.header("Permissions-Policy", "microphone=(self)");
   if (req.method === "OPTIONS") return res.status(200).end();
   next();
 });
 
-// --- Request logging ---
-app.use((req, res, next) => {
-  console.log(
-    `${new Date().toISOString()} - ${req.method} ${req.path} - IP: ${req.ip}`
-  );
-  next();
-});
+// ============================================================
+// CONSTANTS - INCREASED LIMITS
+// ============================================================
 
-/* ============================================================
-   AUTHENTICATION MIDDLEWARE & FUNCTIONS
-   ============================================================ */
-
-// Auth middleware
-const authMiddleware = async (req, res, next) => {
-    const token = req.header("Authorization")?.replace("Bearer ", "").trim();
-
-    if (!token) {
-        return res.status(401).json({ error: "Authentication required" });
-    }
-
-    try {
-        const { data, error } = await supabaseAuthClient.auth.getUser(token);
-        if (!error && data?.user?.id) {
-            req.user = {
-                id: data.user.id,
-                email: data.user.email || null,
-                supabase: true,
-            };
-            req.userId = data.user.id;
-            return next();
-        }
-    } catch (error) {
-        console.warn("Supabase auth verification failed:", error.message);
-    }
-
-    try {
-        const decoded = jwt.verify(token, JWT_SECRET);
-        const userKey = `auth_user_${decoded.userId}`;
-        const user = await db.get(userKey);
-
-        if (!user) {
-            return res.status(401).json({ error: "User not found" });
-        }
-
-        req.user = user;
-        req.userId = user.id;
-        return next();
-    } catch (error) {
-        console.error("Auth middleware error:", error.message);
-        if (error.name === "JsonWebTokenError") {
-            return res.status(401).json({ error: "Invalid token" });
-        }
-        if (error.name === "TokenExpiredError") {
-            return res.status(401).json({ error: "Token expired" });
-        }
-        return res.status(401).json({ error: "Please authenticate" });
-    }
-};
-
-// User functions
-async function createUser(email, password, name) {
-    const emailKey = `auth_email_${email.toLowerCase()}`;
-    
-    // Check if user exists
-    const existing = await db.get(emailKey);
-    if (existing) {
-        throw new Error('User already exists');
-    }
-    
-    // Hash password
-    const hashedPassword = await bcrypt.hash(password, 10);
-    
-    // Create user ID
-    const userId = `user_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    
-    // User data
-    const userData = {
-        id: userId,
-        email: email.toLowerCase(),
-        password: hashedPassword,
-        name,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString()
-    };
-    
-    // Store user data
-    await db.set(emailKey, userId); // email -> userId mapping
-    await db.set(`auth_user_${userId}`, userData); // userId -> user data
-    
-    return userData;
-}
-
-async function findUserByEmail(email) {
-    const emailKey = `auth_email_${email.toLowerCase()}`;
-    const userId = await db.get(emailKey);
-    if (!userId) return null;
-    
-    return await db.get(`auth_user_${userId}`);
-}
-
-async function findUserById(userId) {
-    return await db.get(`auth_user_${userId}`);
-}
-
-/* ============================================================
-   AUTHENTICATION ENDPOINTS
-   ============================================================ */
-
-// Register endpoint
-app.post('/api/auth/register', authLimiter, async (req, res) => {
-    try {
-        const { email, password, name } = req.body;
-        
-        // Validate input
-        if (!email || !password || !name) {
-            return res.status(400).json({ error: 'All fields are required' });
-        }
-        
-        // Email validation
-        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-        if (!emailRegex.test(email)) {
-            return res.status(400).json({ error: 'Invalid email format' });
-        }
-        
-        // Password validation
-        if (password.length < 6) {
-            return res.status(400).json({ error: 'Password must be at least 6 characters' });
-        }
-        
-        // Create user
-        const user = await createUser(email, password, name);
-        
-        // Generate JWT token
-        const token = jwt.sign(
-            { userId: user.id, email: user.email },
-            JWT_SECRET,
-            { expiresIn: '7d' }
-        );
-        
-        // Remove password from response
-        const { password: _, ...userWithoutPassword } = user;
-        
-        res.status(201).json({
-            success: true,
-            token,
-            user: userWithoutPassword,
-            message: 'Registration successful'
-        });
-    } catch (error) {
-        console.error('Registration error:', error.message);
-        if (error.message === 'User already exists') {
-            return res.status(400).json({ error: error.message });
-        }
-        res.status(500).json({ error: 'Registration failed' });
-    }
-});
-
-// Login endpoint
-app.post('/api/auth/login', authLimiter, async (req, res) => {
-    try {
-        const { email, password } = req.body;
-        
-        // Validate input
-        if (!email || !password) {
-            return res.status(400).json({ error: 'Email and password required' });
-        }
-        
-        // Find user
-        const user = await findUserByEmail(email);
-        if (!user) {
-            return res.status(401).json({ error: 'Invalid credentials' });
-        }
-        
-        // Check password
-        const isPasswordValid = await bcrypt.compare(password, user.password);
-        if (!isPasswordValid) {
-            return res.status(401).json({ error: 'Invalid credentials' });
-        }
-        
-        // Generate JWT token
-        const token = jwt.sign(
-            { userId: user.id, email: user.email },
-            JWT_SECRET,
-            { expiresIn: '7d' }
-        );
-        
-        // Update last login
-        user.updatedAt = new Date().toISOString();
-        user.lastLogin = new Date().toISOString();
-        await db.set(`auth_user_${user.id}`, user);
-        
-        // Remove password from response
-        const { password: _, ...userWithoutPassword } = user;
-        
-        res.json({
-            success: true,
-            token,
-            user: userWithoutPassword,
-            message: 'Login successful'
-        });
-    } catch (error) {
-        console.error('Login error:', error);
-        res.status(500).json({ error: 'Login failed' });
-    }
-});
-
-// Get current user
-app.get('/api/auth/me', authMiddleware, async (req, res) => {
-    try {
-        if (req.user?.supabase) {
-            return res.json({
-                success: true,
-                user: {
-                    id: req.user.id,
-                    email: req.user.email,
-                },
-            });
-        }
-        const { password: _, ...userWithoutPassword } = req.user;
-        res.json({
-            success: true,
-            user: userWithoutPassword
-        });
-    } catch (error) {
-        res.status(500).json({ error: 'Failed to fetch user data' });
-    }
-});
-
-// Logout (client-side only)
-app.post('/api/auth/logout', authMiddleware, async (req, res) => {
-    res.json({ success: true, message: 'Logged out successfully' });
-});
-
-// Check if email exists (for registration)
-app.post('/api/auth/check-email', async (req, res) => {
-    try {
-        const { email } = req.body;
-        if (!email) {
-            return res.status(400).json({ error: 'Email required' });
-        }
-        
-        const user = await findUserByEmail(email);
-        res.json({ exists: !!user });
-    } catch (error) {
-        res.status(500).json({ error: 'Failed to check email' });
-    }
-});
-
-/* ============================================================
-   MEMORY ENGINE v3 - Safe extraction & storage
-   ============================================================ */
-
-const MEMORY_CATEGORIES = {
-  personal: [
-    "name",
-    "age",
-    "birthday",
-    "city",
-    "location",
-    "country",
-    "hometown",
-  ],
-  relationships: [
-    "girlfriend",
-    "boyfriend",
-    "wife",
-    "husband",
-    "partner",
-    "friend",
-    "best_friend",
-  ],
-  preferences: [
-    "favorite",
-    "favourite",
-    "fav",
-    "like",
-    "dislike",
-    "hobby",
-    "music",
-    "movie",
-    "food",
-    "color",
-    "colour",
-  ],
-  work_education: [
-    "job",
-    "profession",
-    "work",
-    "company",
-    "occupation",
-    "school",
-    "college",
-    "university",
-  ],
-  pets_family: [
-    "pet",
-    "dog",
-    "cat",
-    "brother",
-    "sister",
-    "mother",
-    "father",
-    "family",
-  ],
-  possessions: ["car", "phone", "computer", "house"],
-};
-
-const BANNED_MEMORY_KEYS = new Set([
-  "code",
-  "bot",
-  "chatbot",
-    "app",
-  "website",
-  "project",
-  "error",
-  "issue",
-  "problem",
-  "api",
-  "server",
-  "message",
-  "response",
-  "output",
-  "logs",
-  "stack",
-]);
-
-function unwrapDbData(data) {
-  if (!data) return null;
-  let result = data;
-  while (
-    result &&
-    typeof result === "object" &&
-    Object.prototype.hasOwnProperty.call(result, "value")
-  ) {
-    result = result.value;
-  }
-  return result;
-}
-
-function detectCategory(key) {
-  const k = key.toLowerCase();
-  for (const [category, terms] of Object.entries(MEMORY_CATEGORIES)) {
-    for (const t of terms) {
-      if (k.includes(t)) return category;
-    }
-  }
-  return null;
-}
-
-function isBadValue(value) {
-  if (!value || typeof value !== "string") return true;
-  const trimmed = value.trim();
-  if (trimmed.length === 0) return true;
-  if (
-    /(error|not working|failed|issue|problem|crash|stack trace|exception)/i.test(
-      trimmed,
-    )
-  )
-    return true;
-  if (trimmed.length > 120) return true;
-  return false;
-}
-
-function sanitizeKey(rawKey) {
-  return rawKey
-    .toLowerCase()
-    .replace(/[^a-z0-9\s_]/g, "")
-    .trim()
-    .replace(/\s+/g, "_")
-    .slice(0, 40);
-}
-
-function extractMemory(userMessage) {
-  const info = {};
-  if (!userMessage || typeof userMessage !== "string") return null;
-
-  const message = userMessage.trim();
-
-  const pattern = /my\s+([a-zA-Z\s]{1,25})\s+(?:is|are)\s+([^.!?]{1,100})/gi;
-  let match;
-  while ((match = pattern.exec(message)) !== null) {
-    const rawKey = match[1].trim();
-    const rawValue = match[2].trim();
-
-    const key = sanitizeKey(rawKey);
-    const value = rawValue.trim();
-
-    if (!key || BANNED_MEMORY_KEYS.has(key)) continue;
-    if (isBadValue(value)) continue;
-
-    const category = detectCategory(key);
-    if (!category) continue;
-
-    info[key] = { value, category };
-  }
-
-  const havePattern =
-    /i have (?:a|an)?\s*([a-zA-Z\s]{1,20})\s+(?:named|called|is)\s+([a-zA-Z0-9\s]{1,60})/gi;
-  let hm;
-  while ((hm = havePattern.exec(message)) !== null) {
-    const rawItem = sanitizeKey(hm[1]);
-    const rawName = hm[2].trim();
-
-    if (!rawItem || BANNED_MEMORY_KEYS.has(rawItem)) continue;
-    if (isBadValue(rawName)) continue;
-
-    let key = rawItem;
-    let category = detectCategory(key);
-    if (!category) {
-      if (/(dog|cat|pet)/i.test(rawItem)) {
-        category = "pets_family";
-        key = "pet";
-      } else {
-        category = "personal";
-      }
-    }
-
-    info[key] = { value: rawName, category };
-  }
-
-  const jobPattern = /(?:i am|i'm)\s+(?:a|an)?\s*([a-zA-Z\s]{2,40})(?:\.|$)/i;
-  const jobMatch = message.match(jobPattern);
-  if (jobMatch && jobMatch[1]) {
-    const candidate = jobMatch[1].trim();
-    if (!isBadValue(candidate)) {
-      if (
-        /(engineer|developer|teacher|student|designer|manager|doctor|nurse|lawyer|professor|consultant)/i.test(
-          candidate,
-        )
-      ) {
-        info["job"] = { value: candidate, category: "work_education" };
-      } else if (
-        /^[A-Z][a-z]+(\s[A-Z][a-z]+)?$/.test(candidate) ||
-        candidate.split(" ").length <= 2
-      ) {
-        info["name"] = { value: candidate, category: "personal" };
-      }
-    }
-  }
-
-  return Object.keys(info).length > 0 ? info : null;
-}
-
-async function saveUserMemoryBatch(userId, memories) {
-  if (!userId || !memories || Object.keys(memories).length === 0) return null;
-
-  try {
-    const rows = Object.entries(memories).map(([memoryKey, item]) => ({
-      user_id: userId,
-      category: item.category,
-      memory_key: memoryKey,
-      value: item.value,
-      updated_at: new Date().toISOString(),
-    }));
-
-    const { error } = await supabase
-      .from("user_memory")
-      .upsert(rows, { onConflict: "user_id,category,memory_key" });
-
-    if (error) throw error;
-    return await getUserMemory(userId);
-  } catch (err) {
-    console.error("saveUserMemoryBatch error:", err);
-    return memories;
-  }
-}
-
-async function getUserMemory(userId) {
-  try {
-    const { data, error } = await supabase
-      .from("user_memory")
-      .select("category, memory_key, value, created_at, updated_at")
-      .eq("user_id", userId)
-      .order("updated_at", { ascending: false });
-
-    if (error) throw error;
-
-    const memory = {};
-    for (const category of Object.keys(MEMORY_CATEGORIES)) {
-      memory[category] = {};
-    }
-
-    for (const row of data || []) {
-      memory[row.category] = memory[row.category] || {};
-      memory[row.category][row.memory_key] = {
-        value: row.value,
-        savedAt: row.created_at ? new Date(row.created_at).getTime() : Date.now(),
-        lastAccessed: row.updated_at
-          ? new Date(row.updated_at).getTime()
-          : Date.now(),
-      };
-    }
-
-    return memory;
-  } catch (err) {
-    console.error("getUserMemory error:", err);
-    return {};
-  }
-}
-
-async function updateLastAccessed(userId, category, key) {
-  try {
-    const { error } = await supabase
-      .from("user_memory")
-      .update({ updated_at: new Date().toISOString() })
-      .eq("user_id", userId)
-      .eq("category", category)
-      .eq("memory_key", key);
-    if (error) throw error;
-  } catch (err) {
-    console.error("updateLastAccessed error:", err);
-  }
-}
-
-async function retrieveRelevantMemorySnippet(userId, message) {
-  const memory = await getUserMemory(userId);
-  const flat = [];
-
-  const lower = (message || "").toLowerCase();
-  for (const [category, items] of Object.entries(memory || {})) {
-    if (!items || typeof items !== "object") continue;
-    for (const [key, obj] of Object.entries(items)) {
-      if (!obj || !obj.value) continue;
-      const readableKey = key.replace(/_/g, " ");
-      if (
-        lower.includes(readableKey) ||
-        category === "personal" ||
-        category === "relationships"
-      ) {
-        flat.push(`${readableKey}: ${obj.value}`);
-      }
-    }
-  }
-  if (flat.length === 0) return "No saved personal facts yet.";
-  return flat.slice(0, 12).join("\n");
-}
-
-/* ============================================================
-   CHAT SESSIONS (History Sidebar)
-   ============================================================ */
-
-const MAX_SESSIONS = 50;
-const MAX_HISTORY_LENGTH = 80; // per chat session
-const MAX_MESSAGE_LENGTH = 2000;
-const MAX_RESPONSE_TOKENS = 4000;
+const MAX_SESSIONS = 100;
+const MAX_HISTORY_LENGTH = 150;
+const MAX_MESSAGE_LENGTH = 12000;
+const MAX_RESPONSE_TOKENS = 4000; // ðŸ”¥ INCREASED for full code
+const AUTO_CLEAN_THRESHOLD = 120;
+const CLEAN_KEEP_RECENT = 40;
 const SESSION_LIMIT_WARNING = 100;
 
-function sanitizeInput(text) {
-  if (typeof text !== "string") return "";
-  return text.slice(0, MAX_MESSAGE_LENGTH).trim();
-}
-
-function sessionsKey(userId) {
-  return `sessions_${userId}`;
-}
-function sessionMessagesKey(userId, chatId) {
-  return `chat_${userId}_${chatId}`;
-}
-function makeChatId() {
-  return (
-    "c_" +
-    Date.now().toString(36) +
-    "_" +
-    Math.random().toString(36).slice(2, 7)
-  );
-}
-
-async function listSessions(userId) {
-  return modularHistoryService.listSessions(userId);
-}
-
-async function saveSessions(userId, sessions) {
-  return modularHistoryService.saveSessions(userId, sessions);
-}
-
-async function createSession(userId, title = "New chat") {
-  return modularHistoryService.createSession(userId, title);
-}
-
-async function ensureSession(userId, chatId) {
-  return modularHistoryService.ensureSession(userId, chatId);
-}
-
-async function touchSession(userId, chatId, titleIfEmpty) {
-  return modularHistoryService.touchSession(userId, chatId, titleIfEmpty);
-}
-
-async function deleteSession(userId, chatId) {
-  return modularHistoryService.deleteSession(userId, chatId);
-}
-
-async function saveMessage(userId, role, message, chatId = "default") {
-  return modularHistoryService.saveMessage(userId, role, message, chatId);
-}
-
-async function getChatHistory(userId, chatId = "default") {
-  return modularHistoryService.getChatHistory(userId, chatId);
-}
-
-const modularHistoryService = createHistoryService({
-  supabase,
+const historyService = createHistoryService({
+  db,
+  unwrapDbData: (value) => value,
   config: {
     maxSessions: MAX_SESSIONS,
     maxHistoryLength: MAX_HISTORY_LENGTH,
     maxMessageLength: MAX_MESSAGE_LENGTH,
+    autoCleanThreshold: AUTO_CLEAN_THRESHOLD,
+    cleanKeepRecent: CLEAN_KEEP_RECENT,
   },
 });
 
@@ -703,7 +112,7 @@ const sarvamService = createSarvamService({
 });
 
 const chatService = createChatService({
-  historyService: modularHistoryService,
+  historyService,
   sarvamService,
   config: {
     maxResponseTokens: MAX_RESPONSE_TOKENS,
@@ -711,452 +120,970 @@ const chatService = createChatService({
   },
 });
 
-/* ============================================================
-   PROTECTED CHAT ENDPOINTS
-   ============================================================ */
+console.log("[BOOT] Modular services ready: historyService, sarvamService, chatService");
+console.log("[BOOT] LangChain orchestration is enabled for normal /chat requests");
+console.log("[BOOT] Sarvam remains the final model provider for normal chat");
 
-// Create new session (protected)
-app.post("/chat/new", authMiddleware, async (req, res) => {
-  const { title } = req.body;
-  const userId = req.userId;
+const {
+  createSession,
+  ensureSession,
+  forceCleanChat,
+  getChatHistory,
+  listSessions,
+  saveMessage,
+  saveSessions,
+  sessionsKey,
+  sessionMessagesKey,
+  touchSession,
+  unwrapDbData,
+} = historyService;
+
+// ============================================================
+// HELPER FUNCTIONS
+// ============================================================
+
+// Current server time in IST for deterministic date/time answers.
+function getISTString() {
+  const now = new Date();
+  const dtf = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Kolkata",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+  const parts = dtf.formatToParts(now);
+  const get = (type) => parts.find((p) => p.type === type)?.value || "00";
+  return `${get("year")}-${get("month")}-${get("day")} ${get("hour")}:${get("minute")} IST`;
+}
+function buildMediaSystemPrompt(mimeType = "") {
+  const mime = String(mimeType || "").toLowerCase();
+  const extractionMode =
+    mime.startsWith("image/") || mime === "application/pdf"
+      ? "For images and PDFs, prioritize accurate extraction over paraphrasing."
+      : "For text files, preserve key structure and summarize only when useful.";
+
+  return [
+    "You analyze uploaded media and answer clearly and accurately.",
+    extractionMode,
+    "Do not invent details. If content is unreadable, mark it as [unclear].",
+    "If the user asks for actions on the file, provide step-by-step output.",
+    "For any multi-line code, always use fenced markdown code blocks with triple backticks and a language tag when known.",
+    "Do not leave code fences unclosed.",
+    "Always format inline code with backticks and never output placeholder tokens like @@INLINECODE0@@ or @@INLINE_CODE_0@@.",
+  ].join(" ");
+}
+
+function isTextLikeMime(mimeType) {
+  const mime = String(mimeType || "").toLowerCase();
+  return (
+    mime.startsWith("text/") ||
+    mime.includes("json") ||
+    mime.includes("csv") ||
+    mime.includes("xml") ||
+    mime.includes("javascript")
+  );
+}
+
+function mapRoleForGemini(role) {
+  if (role === "assistant") return "model";
+  return "user";
+}
+
+function extractGeminiText(data) {
+  const parts = data?.candidates?.[0]?.content?.parts;
+  if (!Array.isArray(parts)) return "";
+  return parts
+    .map((p) => p?.text || "")
+    .join("")
+    .trim();
+}
+
+async function callGeminiGenerateContent({
+  systemInstruction = "",
+  contents = [],
+  temperature = 0.7,
+  maxOutputTokens = 1024,
+  model = GEMINI_MODEL,
+  signal,
+}) {
+  const normalizedModel = String(model || GEMINI_MODEL)
+    .trim()
+    .replace(/^models\//i, "");
+  const versions = Array.from(
+    new Set([
+      GEMINI_API_VERSION,
+      GEMINI_API_VERSION === "v1beta" ? "v1" : "v1beta",
+    ]),
+  );
+  let lastError = null;
+
+  for (const version of versions) {
+    const endpoint = `https://generativelanguage.googleapis.com/${version}/models/${encodeURIComponent(normalizedModel)}:generateContent?key=${encodeURIComponent(process.env.GEMINI_API_KEY)}`;
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: systemInstruction }] },
+        contents,
+        generationConfig: {
+          temperature,
+          maxOutputTokens,
+        },
+      }),
+      signal,
+    });
+
+    if (response.ok) {
+      const data = await response.json();
+      const text = extractGeminiText(data);
+      return text || "No response.";
+    }
+
+    const errorText = await response.text();
+    lastError = {
+      status: response.status,
+      body: errorText,
+      version,
+      model: normalizedModel,
+    };
+    if (response.status !== 404) {
+      break;
+    }
+  }
+
+  const err = new Error(
+    `Gemini API error: ${lastError?.status || 500} model=${lastError?.model || normalizedModel}`,
+  );
+  err.status = lastError?.status || 500;
+  err.body = lastError?.body || "";
+  err.version = lastError?.version || GEMINI_API_VERSION;
+  err.model = lastError?.model || normalizedModel;
+  throw err;
+}
+
+async function callDeepAiTextToImage(prompt, signal) {
+  const apiKey = String(process.env.DEEPAI_API_KEY || "").trim();
+  if (!apiKey) {
+    const err = new Error("Missing DEEPAI_API_KEY");
+    err.code = "MISSING_DEEPAI_KEY";
+    throw err;
+  }
+
+  const response = await fetch(`${DEEPAI_API_BASE}/text2img`, {
+    method: "POST",
+    headers: {
+      "Api-Key": apiKey,
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: new URLSearchParams({ text: String(prompt || "") }).toString(),
+    signal,
+  });
+
+  const raw = await response.text();
+  let parsed = null;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    parsed = null;
+  }
+
+  if (!response.ok) {
+    const err = new Error(
+      `DeepAI API error: ${response.status} ${raw.slice(0, 240)}`,
+    );
+    err.status = response.status;
+    throw err;
+  }
+
+  const imageUrl = String(
+    parsed?.output_url || parsed?.outputUrl || parsed?.image || "",
+  ).trim();
+
+  if (!imageUrl) {
+    const err = new Error(`DeepAI API returned no image URL: ${raw.slice(0, 240)}`);
+    err.status = 502;
+    throw err;
+  }
+
+  return {
+    imageUrl,
+    id: parsed?.id || "",
+  };
+}
+
+async function supabaseAuthRequired(req, res, next) {
+  const auth = req.headers.authorization || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+  if (!token) return res.status(401).json({ error: "Unauthorized" });
+
+  const { data, error } = await supabase.auth.getUser(token);
+  if (error || !data?.user?.id) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  req.auth = { sub: data.user.id, email: data.user.email || null };
+  next();
+}
+
+// ============================================================
+// ENDPOINTS
+// ============================================================
+
+app.get("/", (req, res) => {
+  res.json({
+    status: "âœ… Genie Backend (COMPLETE FIXED)",
+    timestamp: new Date().toISOString(),
+    limits: {
+      maxHistory: MAX_HISTORY_LENGTH,
+      maxMessage: MAX_MESSAGE_LENGTH,
+      maxTokens: MAX_RESPONSE_TOKENS,
+      autoCleanAt: AUTO_CLEAN_THRESHOLD,
+      keepAfterClean: CLEAN_KEEP_RECENT,
+      rateLimit: `${MAX_REQUESTS_PER_MINUTE}/min`,
+    },
+  });
+});
+
+// Debug time endpoint (server clock in IST + ISO)
+app.get("/api/time", (req, res) => {
+  res.json({
+    now_ist: getISTString(),
+    now_iso: new Date().toISOString(),
+  });
+});
+
+// Live news endpoint via GDELT
+app.get("/api/news", async (req, res) => {
+  try {
+    const query = String(req.query.q || "").trim();
+    const max = Math.max(1, Math.min(Number(req.query.max) || 10, 20));
+    if (!query) {
+      return res.json({ query, articles: [] });
+    }
+
+    const articles = await fetchGdeltArticles(query, max);
+    return res.json({ query, articles });
+  } catch (err) {
+    console.error("/api/news error:", err);
+    return res.status(500).json({ error: "Failed to fetch live news" });
+  }
+});
+
+// Create new session
+app.post("/chat/new", supabaseAuthRequired, async (req, res) => {
+  const userId = req.auth?.sub;
+  const { title } = req.body || {};
+  if (!userId) return res.status(400).json({ error: "Invalid userId" });
 
   const session = await createSession(userId, title || "New chat");
   res.json(session);
 });
 
-// List sessions (protected)
-app.get("/chats/:userId", authMiddleware, async (req, res) => {
-  const { userId } = req.params;
-  
-  // Verify user can only access their own data
-  if (userId !== req.userId) {
-    return res.status(403).json({ error: "Access denied" });
-  }
+// List sessions
+app.get("/chats/:userId", supabaseAuthRequired, async (req, res) => {
+  const userId = req.auth?.sub;
+  if (!userId) return res.status(400).json({ error: "Invalid userId" });
 
   const sessions = await listSessions(userId);
   res.json({ sessions });
 });
 
-// Get one session messages (protected)
-app.get("/chat/:userId/:chatId", authMiddleware, async (req, res) => {
-  const { userId, chatId } = req.params;
-  
-  // Verify user can only access their own data
-  if (userId !== req.userId) {
-    return res.status(403).json({ error: "Access denied" });
-  }
+// Get chat messages
+app.get("/chat/:userId/:chatId", supabaseAuthRequired, async (req, res) => {
+  const userId = req.auth?.sub;
+  const { chatId } = req.params;
+  if (!userId) return res.status(400).json({ error: "Invalid userId" });
 
   const messages = await getChatHistory(userId, chatId);
   res.json({ chatId, messages });
 });
 
-// Delete one session (protected)
-app.delete("/chat/:userId/:chatId", authMiddleware, async (req, res) => {
-  const { userId, chatId } = req.params;
-  
-  // Verify user can only access their own data
-  if (userId !== req.userId) {
-    return res.status(403).json({ error: "Access denied" });
+async function analyzeMediaHandler(req, res) {
+  const userId = req.auth?.sub;
+  const { prompt, mediaData, imageData, mediaName, mediaType, chatId } =
+    req.body || {};
+  const activeChatId = chatId || "default";
+  const uploadData = mediaData || imageData;
+
+  if (!userId || !uploadData || typeof uploadData !== "string") {
+    return res.status(400).json({ error: "Invalid request" });
   }
 
-  await deleteSession(userId, chatId);
-  res.json({ ok: true });
-});
-
-app.put("/chat/:userId/:chatId/title", authMiddleware, async (req, res) => {
-  const { userId, chatId } = req.params;
-  const title = String(req.body?.title || "").trim().slice(0, 60);
-
-  if (userId !== req.userId) {
-    return res.status(403).json({ error: "Access denied" });
-  }
-  if (!title) {
-    return res.status(400).json({ error: "Invalid title" });
-  }
+  const defaultPrompt = "Analyze this file in detail.";
+  const userPrompt = String(prompt || defaultPrompt).trim() || defaultPrompt;
 
   try {
-    const session = await modularHistoryService.updateSessionTitle(
-      userId,
-      chatId,
-      title,
+    const geminiKeyPreview = process.env.GEMINI_API_KEY
+      ? `${process.env.GEMINI_API_KEY.slice(0, 10)}...${process.env.GEMINI_API_KEY.slice(-4)}`
+      : "MISSING";
+    console.log(
+      `[KEY CHECK] route=/analyze-media provider=GEMINI key=${geminiKeyPreview} chatId=${activeChatId}`,
     );
 
-    if (!session) {
-      return res.status(404).json({ error: "Chat not found" });
+    const dataUrlMatch = uploadData.match(
+      /^data:([a-zA-Z0-9.+-]+\/[a-zA-Z0-9.+-]+);base64,(.+)$/,
+    );
+    if (!dataUrlMatch) {
+      return res.status(400).json({ error: "Invalid media format" });
     }
 
-    return res.json({ success: true, chatId: session.chatId, title: session.title });
-  } catch (error) {
-    console.error("❌ Error updating chat title:", error);
-    return res.status(500).json({ error: "Failed to update title" });
-  }
-});
+    const mimeType = String(mediaType || dataUrlMatch[1] || "").toLowerCase();
+    const base64Data = dataUrlMatch[2];
+    const safeMediaName = String(mediaName || "uploaded-file").slice(0, 160);
 
-// Delete ALL chat sessions for a user (protected)
-app.delete("/chats/:userId", authMiddleware, async (req, res) => {
-  const { userId } = req.params;
-  
-  // Verify user can only access their own data
-  if (userId !== req.userId) {
-    return res.status(403).json({ error: "Access denied" });
-  }
-
-  try {
-    const sessions = await listSessions(userId);
-    for (const s of sessions) {
-      await deleteSession(userId, s.chatId);
+    if (!process.env.GEMINI_API_KEY) {
+      return res.status(200).json({
+        reply:
+          "Media analysis is not configured on backend. Add GEMINI_API_KEY in server secrets/env and try again.",
+      });
     }
 
-    res.json({ ok: true, deleted: sessions.length });
+    const userParts = [{ text: userPrompt }];
+    if (mimeType.startsWith("image/")) {
+      userParts.push({
+        inlineData: { mimeType, data: base64Data },
+      });
+    } else if (mimeType === "application/pdf") {
+      userParts.push({
+        inlineData: { mimeType, data: base64Data },
+      });
+    } else if (isTextLikeMime(mimeType)) {
+      // For text-like uploads, inline text is more reliable than binary upload.
+      let decodedText = "";
+      try {
+        decodedText = Buffer.from(base64Data, "base64").toString("utf8");
+      } catch (err) {
+        decodedText = "";
+      }
+
+      if (!decodedText.trim()) {
+        return res.status(200).json({
+          reply:
+            "This text file could not be decoded. Try uploading UTF-8 text, or convert it to PDF.",
+        });
+      }
+
+      const clipped = decodedText.slice(0, 80000);
+      userParts.push({
+        text: `File: ${safeMediaName}\n\n${clipped}`,
+      });
+    } else {
+      return res.status(200).json({
+        reply:
+          "This file type is not supported yet for direct analysis. Please convert it to PDF, TXT, CSV, or image and upload again.",
+      });
+    }
+
+    const mediaMaxTokens = Number(process.env.MEDIA_MAX_TOKENS || 4096);
+    const mediaTemperature = Number(process.env.MEDIA_TEMPERATURE || 0.1);
+    const rawReply = await callGeminiGenerateContent({
+      systemInstruction: buildMediaSystemPrompt(mimeType),
+      contents: [{ role: "user", parts: userParts }],
+      temperature: mediaTemperature,
+      maxOutputTokens: mediaMaxTokens,
+      model: GEMINI_MEDIA_MODEL,
+    });
+
+    const reply = cleanAssistantReply(rawReply || "I could not analyze this file.");
+
+    await saveMessage(
+      userId,
+      "user",
+      `[Media: ${mimeType}] ${userPrompt}`,
+      activeChatId,
+    );
+    await saveMessage(userId, "assistant", reply, activeChatId);
+
+    const history = await getChatHistory(userId, activeChatId);
+    const isFirstMessage = history.length <= 2;
+
+    if (isFirstMessage) {
+      await touchSession(userId, activeChatId, userPrompt);
+    } else {
+      await touchSession(userId, activeChatId);
+    }
+
+    return res.json({
+      reply,
+      isMedia: true,
+    });
   } catch (err) {
-    console.error("❌ delete all chats error:", err);
-    res.status(500).json({ error: "Failed to delete all chats" });
-  }
-});
-
-/* ============================================================
-   Memory query handler
-   ============================================================ */
-
-function handleMemoryQuery(message, memory, userId) {
-  if (!message || !memory) return null;
-  const lower = message.toLowerCase();
-
-  const queries = [
-    {
-      regex:
-        /(what do you know about me|what information do you have|what do you remember about me|tell me everything you know)/i,
-      handler: comprehensiveMemory,
-    },
-    {
-      regex: /(what is my|what's my|tell me my) (job|profession|work)/i,
-      handler: () => findInMemory("job", memory, userId),
-    },
-    {
-      regex: /(how old am i|what is my age)/i,
-      handler: () => findInMemory("age", memory, userId),
-    },
-    {
-      regex: /(what is my|what's my) favorite (color|colour)/i,
-      handler: () => findInMemory("favorite_color", memory, userId),
-    },
-    {
-      regex: /(where do i live|where am i from|my city)/i,
-      handler: () => findInMemory("location", memory, userId),
-    },
-    {
-      regex: /(who is my best friend|tell me about my best friend)/i,
-      handler: () => findInMemory("best_friend", memory, userId),
-    },
-    {
-      regex: /(what is my|what's my|tell me about my) (pet|dog|cat)/i,
-      handler: () => findInMemory("pet", memory, userId),
-    },
-  ];
-
-  for (const q of queries) {
-    const match = message.match(q.regex);
-    if (match) return q.handler(match);
-  }
-
-  const words = lower.split(/\s+/).filter((w) => w.length > 3);
-  for (const w of words) {
-    for (const [category, items] of Object.entries(memory || {})) {
-      if (!items || typeof items !== "object") continue;
-      for (const [k, v] of Object.entries(items)) {
-        if (!v || !v.value) continue;
-        const keyStr = k.replace(/_/g, " ");
-        if (keyStr.includes(w) || v.value.toLowerCase().includes(w)) {
-          updateLastAccessed(userId, category, k);
-          return `You told me your ${keyStr} is ${v.value}.`;
-        }
-      }
+    console.error("/analyze-media error:", err);
+    if (err?.status === 404) {
+      return res.status(200).json({
+        reply:
+          `Media analysis model not found: \`${err.model || GEMINI_MODEL}\` for API \`${err.version || GEMINI_API_VERSION}\`. ` +
+          "Set GEMINI_MODEL to a valid model (for example `gemini-2.5-flash`) and retry.",
+      });
     }
-  }
-
-  return null;
-
-  function findInMemory(keyName, memoryObj, userIdLocal) {
-    for (const [category, items] of Object.entries(memoryObj || {})) {
-      if (!items || typeof items !== "object") continue;
-      if (items[keyName] && items[keyName].value) {
-        updateLastAccessed(userIdLocal, category, keyName);
-        return keyName === "job"
-          ? `You work as a ${items[keyName].value}.`
-          : `Your ${keyName.replace(/_/g, " ")} is ${items[keyName].value}.`;
-      }
-    }
-    for (const [category, items] of Object.entries(memoryObj || {})) {
-      if (!items || typeof items !== "object") continue;
-      for (const [k, v] of Object.entries(items)) {
-        if (k.includes(keyName) && v && v.value) {
-          updateLastAccessed(userIdLocal, category, k);
-          return `Your ${k.replace(/_/g, " ")} is ${v.value}.`;
-        }
-      }
-    }
-    return `I don't know your ${keyName.replace(/_/g, " ")} yet.`;
-  }
-
-  function comprehensiveMemory() {
-    let total = 0;
-    let response = "Here's what I know about you:\n\n";
-    for (const [category, items] of Object.entries(memory || {})) {
-      if (!items || typeof items !== "object") continue;
-      let chunk = "";
-      for (const [k, v] of Object.entries(items)) {
-        if (
-          v &&
-          v.value &&
-          typeof v.value === "string" &&
-          v.value.trim().length > 0
-        ) {
-          chunk += `  • ${k.replace(/_/g, " ")}: ${v.value}\n`;
-          total++;
-        }
-      }
-      if (chunk.length > 0) {
-        response += `**${category.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase())}:**\n`;
-        response += chunk + "\n";
-      }
-    }
-    if (total === 0)
-      return "I don't have any information about you yet. Tell me something about yourself!";
-    return response;
+    return res.status(500).json({
+      reply: "Sorry, an error occurred while analyzing the file.",
+    });
   }
 }
 
-/* ============================================================
-   Main chat endpoint (protected)
-   ============================================================ */
+app.post("/analyze-media", supabaseAuthRequired, analyzeMediaHandler);
+app.post("/analyze-image", supabaseAuthRequired, analyzeMediaHandler);
 
-app.post("/chat", authMiddleware, chatLimiter, async (req, res) => {
-  const { message, chatId } = req.body;
-  const userId = req.userId;
+app.post("/generate-image", supabaseAuthRequired, async (req, res) => {
+  const userId = req.auth?.sub;
+  const { prompt, chatId } = req.body || {};
   const activeChatId = chatId || "default";
+  const userPrompt = String(prompt || "").trim();
 
-  if (!message || typeof message !== "string" || message.trim().length === 0) {
-    return res.status(400).json({ error: "Message cannot be empty" });
+  if (!userId || !userPrompt) {
+    return res.status(400).json({ error: "Prompt is required" });
+  }
+
+  const rateLimit = checkRateLimit(userId);
+  if (!rateLimit.allowed) {
+    return res.status(429).json({
+      reply: "Too many requests. Please wait a minute.",
+      isRateLimited: true,
+    });
   }
 
   try {
-    const sanitizedMessage = message.trim();
+    const result = await callDeepAiTextToImage(userPrompt);
+    const reply = `Generated image for: "${userPrompt}"\n${result.imageUrl}`;
+
+    await saveMessage(userId, "user", userPrompt, activeChatId);
+    await saveMessage(userId, "assistant", reply, activeChatId);
+
+    const history = await getChatHistory(userId, activeChatId);
+    const isFirstMessage = history.length <= 2;
+    if (isFirstMessage) {
+      await touchSession(userId, activeChatId, userPrompt);
+    } else {
+      await touchSession(userId, activeChatId);
+    }
+
+    return res.json({
+      reply,
+      imageUrl: result.imageUrl,
+      provider: "deepai",
+    });
+  } catch (err) {
+    if (err?.code === "MISSING_DEEPAI_KEY") {
+      return res.status(200).json({
+        reply:
+          "Image generation is not configured on backend. Add DEEPAI_API_KEY in .env and restart server.",
+      });
+    }
+    console.error("/generate-image error:", err);
+    if (Number(err?.status) >= 400 && Number(err?.status) < 500) {
+      return res.status(Number(err.status)).json({
+        reply: `Image provider error (${err.status}): ${err.message}`,
+      });
+    }
+    return res.status(500).json({
+      reply: `Image generation failed: ${err?.message || "Unknown error"}`,
+    });
+  }
+});
+
+// Save client-side/manual replies (e.g., weather special command) into chat history.
+app.post("/chat/manual", supabaseAuthRequired, async (req, res) => {
+  const userId = req.auth?.sub;
+  const { message, reply, chatId } = req.body || {};
+  const activeChatId = chatId || "default";
+
+  if (!userId || !String(message || "").trim() || !String(reply || "").trim()) {
+    return res.status(400).json({ error: "Invalid request" });
+  }
+
+  try {
+    await saveMessage(userId, "user", String(message).trim(), activeChatId);
+    await saveMessage(userId, "assistant", String(reply).trim(), activeChatId);
+
+    const history = await getChatHistory(userId, activeChatId);
+    const isFirstMessage = history.length <= 2;
+    if (isFirstMessage) {
+      await touchSession(userId, activeChatId, String(message).trim());
+    } else {
+      await touchSession(userId, activeChatId);
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("❌ /chat/manual error:", err);
+    return res.status(500).json({ error: "Failed to save manual chat" });
+  }
+});
+
+// Roll back last assistant reply for a just-cancelled request.
+app.post("/chat/rollback-last", supabaseAuthRequired, async (req, res) => {
+  const userId = req.auth?.sub;
+  const { chatId, userMessage } = req.body || {};
+  const activeChatId = chatId || "default";
+  const expectedUser = String(userMessage || "").trim();
+  if (!userId || !activeChatId || !expectedUser) {
+    return res.status(400).json({ error: "Invalid request" });
+  }
+
+  try {
+    const key =
+      activeChatId === "default"
+        ? `chat_${userId}`
+        : sessionMessagesKey(userId, activeChatId);
+    const raw = await db.get(key);
+    const history = Array.isArray(unwrapDbData(raw)) ? unwrapDbData(raw) : [];
+    if (history.length < 2) return res.json({ ok: true, removed: false });
+
+    const last = history[history.length - 1];
+    const prev = history[history.length - 2];
+    if (
+      last?.role === "assistant" &&
+      prev?.role === "user" &&
+      String(prev?.message || "").trim() === expectedUser
+    ) {
+      history.pop(); // remove only assistant reply, keep user prompt
+      await db.set(key, history);
+      return res.json({ ok: true, removed: true });
+    }
+
+    return res.json({ ok: true, removed: false });
+  } catch (err) {
+    console.error("❌ /chat/rollback-last error:", err);
+    return res.status(500).json({ error: "Failed to rollback message" });
+  }
+});
+// ============================================================
+// MAIN CHAT ENDPOINT - WITH SESSION LIMIT WARNING
+// ============================================================
+
+app.post("/chat", supabaseAuthRequired, async (req, res) => {
+  const userId = req.auth?.sub;
+  const { message, chatId, promptEnvelope } = req.body || {};
+  const activeChatId = chatId || "default";
+  let clientDisconnected = false;
+  req.on("close", () => {
+    clientDisconnected = true;
+  });
+
+  if (!userId || !message || message.trim().length === 0) {
+    return res.status(400).json({ error: "Invalid request" });
+  }
+
+  const rateLimit = checkRateLimit(userId);
+  if (!rateLimit.allowed) {
+    return res.status(429).json({
+      reply: `â³ Too many requests. Please wait a minute.`,
+      isRateLimited: true,
+    });
+  }
+
+  try {
+    const sarvamKeyPreview = process.env.SARVAM_API_KEY
+      ? `${process.env.SARVAM_API_KEY.slice(0, 10)}...${process.env.SARVAM_API_KEY.slice(-4)}`
+      : "MISSING";
     console.log(
-      "🔍 New message from",
-      userId,
-      "chatId:",
-      activeChatId,
-      ":",
-      sanitizedMessage.slice(0, 50),
+      `[KEY CHECK] route=/chat provider=SARVAM key=${sarvamKeyPreview} chatId=${activeChatId}`,
     );
 
-    // Ensure session exists if chatId is provided
-    await ensureSession(userId, activeChatId);
-
-    // If first user message, use it as title (touch later)
-    const titleCandidate = sanitizedMessage.slice(0, 28);
-
-    // 1) Memory extraction
-    const extracted = extractMemory(sanitizedMessage);
-    if (extracted) {
-      await saveUserMemoryBatch(userId, extracted);
-
-      const keys = Object.keys(extracted);
-      let reply;
-      if (keys.length === 1) {
-        const k = keys[0];
-        reply = `Thanks — I'll remember that your ${k.replace(/_/g, " ")} is ${extracted[k].value}.`;
-      } else {
-        reply = "Thanks — I'll remember that:\n";
-        for (const k of keys)
-          reply += `• ${k.replace(/_/g, " ")}: ${extracted[k].value}\n`;
-      }
-
-      await saveMessage(userId, "user", sanitizedMessage, activeChatId);
-      await saveMessage(userId, "assistant", reply, activeChatId);
-      await touchSession(userId, activeChatId, titleCandidate);
-
-      return res.json({ reply });
-    }
-
-    // 2) Memory query
-    const memory = await getUserMemory(userId);
-    const memoryQueryReply = handleMemoryQuery(
-      sanitizedMessage,
-      memory,
-      userId,
+    console.log(
+      `ðŸ’¬ Chat request: ${userId.slice(0, 8)}... | ${String(message).trim().length} chars | chatId: ${activeChatId}`,
     );
-    if (memoryQueryReply) {
-      await saveMessage(userId, "user", sanitizedMessage, activeChatId);
-      await saveMessage(userId, "assistant", memoryQueryReply, activeChatId);
-      await touchSession(userId, activeChatId, titleCandidate);
+    console.log("[CHAT FLOW] Starting LangChain prompt orchestration -> Sarvam response flow");
 
-      return res.json({ reply: memoryQueryReply });
-    }
-
-    // 3) Normal chat path now uses LangChain prompt orchestration + Sarvam backend
+    // âœ… CALL SARVAM AI
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 45000);
+    req.on("close", () => {
+      try {
+        controller.abort();
+      } catch {}
+    });
+    const timeout = setTimeout(() => controller.abort(), 60000);
 
-    const result = await chatService.handleChat({
+    const chatResult = await chatService.handleChat({
       userId,
-      message: sanitizedMessage,
       chatId: activeChatId,
+      message,
+      promptEnvelope,
       signal: controller.signal,
     });
 
     clearTimeout(timeout);
-
-    res.json(result);
-  } catch (err) {
-    console.error("❌ /chat error:", err);
-    if (err.name === "AbortError") {
-      return res.status(408).json({
-        error: "Request timeout",
-        reply: "I'm taking too long to respond. Please try again.",
-      });
-    }
-    res
-      .status(500)
-      .json({ error: "Internal server error", details: err.message });
-  }
-});
-
-/* ============================================================
-   Memory endpoints (protected)
-   ============================================================ */
-
-app.get("/memory/:userId", authMiddleware, async (req, res) => {
-  const { userId } = req.params;
-  
-  // Verify user can only access their own data
-  if (userId !== req.userId) {
-    return res.status(403).json({ error: "Access denied" });
-  }
-
-  try {
-    const [memory, defaultChatHistory, sessions] = await Promise.all([
-      getUserMemory(userId),
-      getChatHistory(userId, "default"),
-      listSessions(userId),
-    ]);
-
-    const categories = Object.keys(memory || {});
-    const memoryItems = Object.values(memory || {}).reduce(
-      (acc, cat) => acc + (cat ? Object.keys(cat).length : 0),
-      0,
+    console.log(
+      `[CHAT FLOW] Completed LangChain -> Sarvam flow | replyLength=${String(chatResult?.reply || "").length} | chatId=${activeChatId}`,
     );
 
-    res.json({
-      memory,
-      chatHistory: defaultChatHistory.slice(-5),
-      sessionsCount: sessions.length,
-      stats: { chatCount: defaultChatHistory.length, memoryItems, categories },
-    });
+    // If client stopped/disconnected, do not persist or send cancelled response.
+    if (clientDisconnected || req.aborted) {
+      console.log(`[CHAT FLOW] Client disconnected before response send | chatId=${activeChatId}`);
+      return;
+    }
+    res.json(chatResult);
   } catch (err) {
-    console.error("❌ /memory error:", err);
-    res
-      .status(500)
-      .json({ error: "Failed to fetch memory", details: err.message });
+    console.error("âŒ /chat error:", err);
+    let reply = "Sorry, an error occurred.";
+    if (err.name === "AbortError") {
+      reply = "Request timeout. Try a smaller request.";
+    }
+    res.status(500).json({ reply });
   }
 });
 
-app.delete("/memory/:userId", authMiddleware, async (req, res) => {
-  const { userId } = req.params;
-  
-  // Verify user can only access their own data
-  if (userId !== req.userId) {
-    return res.status(403).json({ error: "Access denied" });
+// ============================================================
+// CLEANUP ENDPOINTS
+// ============================================================
+
+app.post(
+  "/clean-chat/:userId/:chatId",
+  supabaseAuthRequired,
+  async (req, res) => {
+    const userId = req.auth?.sub;
+    const { chatId } = req.params;
+    try {
+      const cleaned = await forceCleanChat(userId, chatId);
+      res.json({
+        success: true,
+        message: `Chat cleaned to ${cleaned.length} messages`,
+        cleanedCount: cleaned.length,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+// ============================================================
+// DELETE ENDPOINTS
+// ============================================================
+
+app.delete("/chat/:userId/:chatId", supabaseAuthRequired, async (req, res) => {
+  const userId = req.auth?.sub;
+  const { chatId } = req.params;
+  if (!userId || !chatId) {
+    return res.status(400).json({ error: "Invalid userId or chatId" });
   }
 
   try {
-    const sessions = await listSessions(userId);
-    const sessionIds = sessions.map((session) => session.chatId);
+    console.log(`ðŸ—‘ï¸ Deleting chat ${chatId} for user ${userId}`);
+    const messagesKey = sessionMessagesKey(userId, chatId);
+    await db.delete(messagesKey);
 
-    await supabase.from("user_memory").delete().eq("user_id", userId);
-    if (sessionIds.length) {
-      await supabase
-        .from("chat_messages")
-        .delete()
-        .eq("user_id", userId)
-        .in("session_id", sessionIds);
+    const sessions = await listSessions(userId);
+    const filteredSessions = sessions.filter((s) => s.chatId !== chatId);
+    await saveSessions(userId, filteredSessions);
+
+    console.log(`âœ… Chat ${chatId} deleted successfully`);
+    res.json({
+      ok: true,
+      message: "Chat deleted successfully",
+      remainingSessions: filteredSessions.length,
+    });
+  } catch (err) {
+    console.error("âŒ Delete session error:", err);
+    res
+      .status(500)
+      .json({ error: "Failed to delete chat", details: err.message });
+  }
+});
+
+app.put(
+  "/chat/:userId/:chatId/title",
+  supabaseAuthRequired,
+  async (req, res) => {
+    const userId = req.auth?.sub;
+    const { chatId } = req.params;
+    const title = String(req.body?.title || "")
+      .trim()
+      .slice(0, 60);
+    if (!userId || !chatId) {
+      return res.status(400).json({ error: "Invalid userId or chatId" });
     }
-    await supabase.from("chat_sessions").delete().eq("user_id", userId);
+    if (!title) {
+      return res.status(400).json({ error: "Invalid title" });
+    }
+    try {
+      const sessions = await listSessions(userId);
+      const idx = sessions.findIndex((s) => s.chatId === chatId);
+      if (idx === -1) {
+        return res.status(404).json({ error: "Chat not found" });
+      }
+      sessions[idx].title = title;
+      sessions[idx].updatedAt = Date.now();
+      const [session] = sessions.splice(idx, 1);
+      sessions.unshift(session);
+      await saveSessions(userId, sessions);
+      return res.json({ success: true, chatId, title });
+    } catch (err) {
+      console.error("❌ Error updating chat title:", err);
+      return res.status(500).json({ error: "Failed to update title" });
+    }
+  },
+);
+
+app.delete("/chats/:userId", supabaseAuthRequired, async (req, res) => {
+  const userId = req.auth?.sub;
+  if (!userId) {
+    return res.status(400).json({ error: "Invalid userId" });
+  }
+
+  try {
+    console.log(`ðŸ—‘ï¸ Deleting ALL chats for user ${userId}`);
+    const sessions = await listSessions(userId);
+    console.log(`Found ${sessions.length} sessions to delete`);
 
     for (const s of sessions) {
-      await deleteSession(userId, s.chatId);
+      try {
+        const key = sessionMessagesKey(userId, s.chatId);
+        await db.delete(key);
+        console.log(`  âœ… Deleted messages: ${s.chatId}`);
+      } catch (err) {
+        console.error(`  âŒ Failed to delete ${s.chatId}:`, err.message);
+      }
     }
 
-    res.json({ message: "User data cleared successfully" });
-  } catch (err) {
-    console.error("❌ delete memory error:", err);
-    res
-      .status(500)
-      .json({ error: "Failed to clear memory", details: err.message });
-  }
-});
+    await db.set(sessionsKey(userId), []);
+    try {
+      await db.delete(`chat_${userId}`);
+    } catch (err) {}
 
-/* ============================================================
-   Public stats endpoint
-   ============================================================ */
-
-app.get("/stats", async (req, res) => {
-  try {
-    const allKeys = await db.list();
-    const userKeys = allKeys.filter((k) => k.startsWith("auth_user_"));
+    console.log(`âœ… All ${sessions.length} chats deleted successfully`);
     res.json({
-      totalUsers: userKeys.length,
-      serverUptime: process.uptime(),
-      timestamp: new Date().toISOString(),
+      ok: true,
+      deleted: sessions.length,
+      message: `Successfully deleted ${sessions.length} chats`,
     });
   } catch (err) {
-    console.error("❌ /stats error:", err);
-    res.status(500).json({ error: "Failed to fetch stats" });
+    console.error("âŒ Delete all chats error:", err);
+    res
+      .status(500)
+      .json({ error: "Failed to delete all chats", details: err.message });
   }
 });
 
-/* ============================================================
-   Health & start
-   ============================================================ */
+app.get(
+  "/check-delete/:userId/:chatId",
+  supabaseAuthRequired,
+  async (req, res) => {
+    const userId = req.auth?.sub;
+    const { chatId } = req.params;
+    try {
+      const messagesKey = sessionMessagesKey(userId, chatId);
+      const messages = await db.get(messagesKey);
+      const sessions = await listSessions(userId);
+      const sessionExists = sessions.some((s) => s.chatId === chatId);
+      res.json({
+        chatId,
+        messagesExist: messages !== null,
+        sessionExists,
+        sessionsCount: sessions.length,
+      });
+    } catch (err) {
+      res.json({ error: err.message });
+    }
+  },
+);
 
-app.get("/", (req, res) => {
-  res.json({
-    status: "✅ Genie backend (with authentication) is live!",
-    timestamp: new Date().toISOString(),
-    version: "4.0.0",
-    features: ["Authentication", "Memory Engine v3", "Chat Sessions"],
-  });
+app.get(
+  "/chat-stats/:userId/:chatId",
+  supabaseAuthRequired,
+  async (req, res) => {
+    const userId = req.auth?.sub;
+    const { chatId } = req.params;
+    try {
+      const key = sessionMessagesKey(userId, chatId);
+      const raw = await db.get(key);
+      const history = Array.isArray(unwrapDbData(raw)) ? unwrapDbData(raw) : [];
+
+      let duplicateCount = 0;
+      for (let i = 1; i < history.length; i++) {
+        if (
+          history[i].role === history[i - 1].role &&
+          history[i].message === history[i - 1].message
+        ) {
+          duplicateCount++;
+        }
+      }
+
+      res.json({
+        totalMessages: history.length,
+        duplicateCount,
+        needsCleaning:
+          history.length > AUTO_CLEAN_THRESHOLD || duplicateCount > 0,
+        autoCleanThreshold: AUTO_CLEAN_THRESHOLD,
+        maxLimit: MAX_HISTORY_LENGTH,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+// auth
+
+const JWT_SECRET = process.env.JWT_SECRET || "change-this-in-replit-secrets";
+const TOKEN_TTL_SECONDS = 60 * 60 * 24 * 7;
+
+const usersKey = (username) => `user_${username.toLowerCase()}`;
+
+function base64url(input) {
+  return Buffer.from(input)
+    .toString("base64")
+    .replace(/=/g, "")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
+}
+
+function signToken(payload) {
+  const header = { alg: "HS256", typ: "JWT" };
+  const now = Math.floor(Date.now() / 1000);
+  const body = { ...payload, iat: now, exp: now + TOKEN_TTL_SECONDS };
+  const h = base64url(JSON.stringify(header));
+  const p = base64url(JSON.stringify(body));
+  const data = `${h}.${p}`;
+  const sig = crypto
+    .createHmac("sha256", JWT_SECRET)
+    .update(data)
+    .digest("base64")
+    .replace(/=/g, "")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
+  return `${data}.${sig}`;
+}
+
+function verifyToken(token) {
+  if (!token) return null;
+  const parts = token.split(".");
+  if (parts.length !== 3) return null;
+  const [h, p, sig] = parts;
+  const data = `${h}.${p}`;
+  const expected = crypto
+    .createHmac("sha256", JWT_SECRET)
+    .update(data)
+    .digest("base64")
+    .replace(/=/g, "")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
+  if (sig !== expected) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(p, "base64url").toString("utf8"));
+    if (!payload.exp || payload.exp < Math.floor(Date.now() / 1000))
+      return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+function hashPassword(password, salt) {
+  return crypto.scryptSync(password, salt, 64).toString("hex");
+}
+
+function authRequired(req, res, next) {
+  const auth = req.headers.authorization || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+  const payload = verifyToken(token);
+  if (!payload) return res.status(401).json({ error: "Unauthorized" });
+  req.auth = payload;
+  next();
+}
+
+app.post("/api/register", async (req, res) => {
+  const username = String(req.body?.username || "").trim();
+  const password = String(req.body?.password || "");
+  if (!username || !password)
+    return res
+      .status(400)
+      .json({ error: "Username and password are required" });
+  if (username.length < 3)
+    return res
+      .status(400)
+      .json({ error: "Username must be at least 3 characters" });
+  if (password.length < 6)
+    return res
+      .status(400)
+      .json({ error: "Password must be at least 6 characters" });
+
+  const existing = await db.get(usersKey(username));
+  if (existing)
+    return res.status(409).json({ error: "Username already exists" });
+
+  const salt = crypto.randomBytes(16).toString("hex");
+  const passwordHash = hashPassword(password, salt);
+  const user = {
+    id: crypto.randomUUID(),
+    username,
+    salt,
+    passwordHash,
+    createdAt: Date.now(),
+  };
+  await db.set(usersKey(username), user);
+
+  const token = signToken({ sub: user.id, username: user.username });
+  res
+    .status(201)
+    .json({ token, user: { id: user.id, username: user.username } });
 });
 
-app.get("/api/health", (req, res) => {
-  res.json({
-    status: "healthy",
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime()
-  });
+app.post("/api/login", async (req, res) => {
+  const username = String(req.body?.username || "").trim();
+  const password = String(req.body?.password || "");
+  if (!username || !password)
+    return res
+      .status(400)
+      .json({ error: "Username and password are required" });
+
+  const user = await db.get(usersKey(username));
+  if (!user) return res.status(401).json({ error: "Invalid credentials" });
+
+  const hash = hashPassword(password, user.salt);
+  if (hash !== user.passwordHash)
+    return res.status(401).json({ error: "Invalid credentials" });
+
+  const token = signToken({ sub: user.id, username: user.username });
+  res.json({ token, user: { id: user.id, username: user.username } });
 });
+
+app.get("/api/me", authRequired, async (req, res) => {
+  const user = await db.get(usersKey(req.auth.username));
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+  res.json({ user: { id: user.id, username: user.username } });
+});
+
+// ============================================================
+// START SERVER
+// ============================================================
 
 app.listen(PORT, () => {
   console.log(`
-✅ Genie backend with AUTHENTICATION running!
-📍 Port: ${PORT}
-🔐 SARVAM_API_KEY: ${process.env.SARVAM_API_KEY ? "Loaded" : "Missing!"}
-🔑 JWT Secret: ${JWT_SECRET ? "Loaded" : "Using default"}
-💾 Memory: Enabled (Safe & categorized)
-🧾 Sessions: Enabled (history sidebar ready)
-👤 Auth: Enabled (Register/Login/JWT)
-🛡️ Rate Limit: 10 requests/minute for chat
+âœ… Genie Backend (COMPLETE FIXED) Running!
+ðŸ“ Port: ${PORT}
+ðŸ” SARVAM_API_KEY (chat): ${process.env.SARVAM_API_KEY ? "Loaded" : "Missing!"}
+ðŸ” GEMINI_API_KEY (media): ${process.env.GEMINI_API_KEY ? "Loaded" : "Missing!"}
+ðŸ” DEEPAI_API_KEY (images): ${process.env.DEEPAI_API_KEY ? "Loaded" : "Missing!"}
+ðŸ§  GEMINI_MODEL: ${GEMINI_MODEL}
+ðŸ§  GEMINI_MEDIA_MODEL: ${GEMINI_MEDIA_MODEL}
+ðŸ§  GEMINI_API_VERSION: ${GEMINI_API_VERSION}
+ðŸ§  MEDIA_MAX_TOKENS: ${Number(process.env.MEDIA_MAX_TOKENS || 4096)}
+ðŸ§  MEDIA_TEMPERATURE: ${Number(process.env.MEDIA_TEMPERATURE || 0.1)}
+
+ðŸ“ˆ FIXED LIMITS:
+  Max History: ${MAX_HISTORY_LENGTH} messages
+  Max Message: ${MAX_MESSAGE_LENGTH} chars  
+  Max Tokens: ${MAX_RESPONSE_TOKENS} for code ðŸ”¥
+  Rate Limit: ${MAX_REQUESTS_PER_MINUTE}/min
+
+ðŸ§¹ AUTO-CLEAN: Clean at ${AUTO_CLEAN_THRESHOLD} messages
+ðŸ’¾ Database: Connected
+ðŸ§¾ Sessions: Max ${MAX_SESSIONS}
+ðŸ§± LangChain Orchestration: Enabled for /chat
+ðŸ¤– Chat Provider: Sarvam (unchanged)
+
+âœ… CHAT TITLE FIXED - First message will appear as title!
+âœ… DUPLICATE CHAT ENDPOINT REMOVED
+âœ… TOKENS INCREASED to 4000 for complete code
   `);
 });
 
-// graceful shutdown
+// Graceful shutdown
 process.on("SIGINT", () => {
-  console.log("\n🛑 Shutting down...");
+  console.log("\nðŸ›‘ Shutting down...");
   process.exit(0);
 });
-process.on("SIGTERM", () => {
-  console.log("\n🛑 Terminated");
-  process.exit(0);
-});
-
-

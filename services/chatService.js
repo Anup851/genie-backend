@@ -260,7 +260,6 @@ export function createChatService({
 }) {
   const { maxResponseTokens, sessionLimitWarning } = config;
   const {
-    ensureSession,
     forceCleanChat,
     getChatHistory,
     saveMessage,
@@ -283,10 +282,6 @@ export function createChatService({
     const optimizedParams = buildChatParams(sanitizedMessage, maxResponseTokens);
     const nowIST = getISTString();
     const newsContext = await getLiveNewsContext(sanitizedMessage);
-
-    if (chatId !== "default") {
-      await ensureSession(userId, chatId);
-    }
 
     let history = await getChatHistory(userId, chatId);
     const sessionWarning = buildSessionWarning(history.length, sessionLimitWarning);

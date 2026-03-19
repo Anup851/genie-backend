@@ -1,19 +1,26 @@
+function createSessionsKey(userId) {
+  return `sessions_${userId}`;
+}
+
+function createSessionMessagesKey(userId, chatId) {
+  return `chat_${userId}_${chatId}`;
+}
+
+function makeChatId() {
+  return (
+    "c_" +
+    Date.now().toString(36) +
+    "_" +
+    Math.random().toString(36).slice(2, 7)
+  );
+}
+
 function sanitizeInput(text, maxMessageLength) {
   if (typeof text !== "string") return "";
   return text.slice(0, maxMessageLength).trim();
 }
 
-function isUuid(value) {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-    String(value || ""),
-  );
-}
-
-export function createHistoryService({ supabase, config }) {
-  if (!supabase) {
-    throw new Error("createHistoryService requires a Supabase client");
-  }
-
+export function createHistoryService({ db, unwrapDbData, config }) {
   const {
     maxSessions,
     maxHistoryLength,
@@ -21,247 +28,113 @@ export function createHistoryService({ supabase, config }) {
     autoCleanThreshold = maxHistoryLength,
     cleanKeepRecent = Math.max(10, Math.floor(maxHistoryLength / 3)),
   } = config;
-
-  async function fetchSessionById(userId, chatId) {
-    if (!userId || !isUuid(chatId)) return null;
-    const { data, error } = await supabase
-      .from("chat_sessions")
-      .select("id, title, created_at, updated_at")
-      .eq("user_id", userId)
-      .eq("id", chatId)
-      .maybeSingle();
-
-    if (error) throw error;
-    if (!data) return null;
-
-    return {
-      chatId: data.id,
-      title: data.title || "New chat",
-      createdAt: data.created_at ? new Date(data.created_at).getTime() : Date.now(),
-      updatedAt: data.updated_at ? new Date(data.updated_at).getTime() : Date.now(),
-    };
-  }
-
-  async function fetchLatestSession(userId) {
-    const { data, error } = await supabase
-      .from("chat_sessions")
-      .select("id, title, created_at, updated_at")
-      .eq("user_id", userId)
-      .order("updated_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
-
-    if (error) throw error;
-    if (!data) return null;
-
-    return {
-      chatId: data.id,
-      title: data.title || "New chat",
-      createdAt: data.created_at ? new Date(data.created_at).getTime() : Date.now(),
-      updatedAt: data.updated_at ? new Date(data.updated_at).getTime() : Date.now(),
-    };
-  }
+  const unwrap = typeof unwrapDbData === "function" ? unwrapDbData : (value) => value;
 
   async function listSessions(userId) {
-    const { data, error } = await supabase
-      .from("chat_sessions")
-      .select("id, title, created_at, updated_at")
-      .eq("user_id", userId)
-      .order("updated_at", { ascending: false })
-      .limit(maxSessions);
-
-    if (error) throw error;
-
-    return (data || []).map((session) => ({
-      chatId: session.id,
-      title: session.title || "New chat",
-      createdAt: session.created_at
-        ? new Date(session.created_at).getTime()
-        : Date.now(),
-      updatedAt: session.updated_at
-        ? new Date(session.updated_at).getTime()
-        : Date.now(),
-    }));
+    const raw = await db.get(createSessionsKey(userId));
+    const sessions = unwrap(raw);
+    return Array.isArray(sessions) ? sessions : [];
   }
 
-  async function saveSessions() {
-    return null;
+  async function saveSessions(userId, sessions) {
+    await db.set(createSessionsKey(userId), sessions.slice(0, maxSessions));
   }
 
   async function createSession(userId, title = "New chat") {
-    const safeTitle = sanitizeInput(title || "New chat", 120) || "New chat";
-    const { data, error } = await supabase
-      .from("chat_sessions")
-      .insert({
-        user_id: userId,
-        title: safeTitle,
-      })
-      .select("id, title, created_at, updated_at")
-      .single();
+    const sessions = await listSessions(userId);
+    const chatId = makeChatId();
 
-    if (error) throw error;
-
-    return {
-      chatId: data.id,
-      title: data.title || "New chat",
-      createdAt: new Date(data.created_at).getTime(),
-      updatedAt: new Date(data.updated_at).getTime(),
+    const session = {
+      chatId,
+      title,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
     };
+
+    sessions.unshift(session);
+    await saveSessions(userId, sessions);
+    await db.set(createSessionMessagesKey(userId, chatId), []);
+
+    return session;
   }
 
   async function ensureSession(userId, chatId) {
-    if (!chatId || chatId === "default") {
-      return fetchLatestSession(userId);
-    }
+    if (!chatId || chatId === "default") return null;
 
-    const existing = await fetchSessionById(userId, chatId);
+    const sessions = await listSessions(userId);
+    const existing = sessions.find((session) => session.chatId === chatId);
     if (existing) return existing;
 
-    if (!isUuid(chatId)) {
-      return createSession(userId, "New chat");
-    }
-
-    const { data, error } = await supabase
-      .from("chat_sessions")
-      .insert({
-        id: chatId,
-        user_id: userId,
-        title: "New chat",
-      })
-      .select("id, title, created_at, updated_at")
-      .single();
-
-    if (error) throw error;
-
-    return {
-      chatId: data.id,
-      title: data.title || "New chat",
-      createdAt: new Date(data.created_at).getTime(),
-      updatedAt: new Date(data.updated_at).getTime(),
+    const session = {
+      chatId,
+      title: "New chat",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
     };
+    sessions.unshift(session);
+    await saveSessions(userId, sessions);
+    await db.set(createSessionMessagesKey(userId, chatId), []);
+    return session;
   }
 
   async function touchSession(userId, chatId, titleIfEmpty) {
-    if (!chatId || chatId === "default" || !isUuid(chatId)) return null;
+    if (!chatId || chatId === "default") return null;
+    const sessions = await listSessions(userId);
+    const index = sessions.findIndex((session) => session.chatId === chatId);
 
-    const existing = await fetchSessionById(userId, chatId);
-    if (!existing) return null;
+    if (index === -1) {
+      const session = {
+        chatId,
+        title: titleIfEmpty || "New chat",
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      };
+      sessions.unshift(session);
+      await saveSessions(userId, sessions);
+      return session;
+    }
 
-    const nextTitle =
-      titleIfEmpty && (!existing.title || existing.title === "New chat")
-        ? sanitizeInput(titleIfEmpty, 120) || "New chat"
-        : existing.title;
+    sessions[index].updatedAt = Date.now();
+    if (
+      titleIfEmpty &&
+      (!sessions[index].title || sessions[index].title === "New chat")
+    ) {
+      sessions[index].title = titleIfEmpty;
+    }
 
-    const { data, error } = await supabase
-      .from("chat_sessions")
-      .update({
-        title: nextTitle,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("user_id", userId)
-      .eq("id", chatId)
-      .select("id, title, created_at, updated_at")
-      .single();
+    const [session] = sessions.splice(index, 1);
+    sessions.unshift(session);
 
-    if (error) throw error;
-
-    return {
-      chatId: data.id,
-      title: data.title || "New chat",
-      createdAt: new Date(data.created_at).getTime(),
-      updatedAt: new Date(data.updated_at).getTime(),
-    };
-  }
-
-  async function updateSessionTitle(userId, chatId, title) {
-    if (!chatId || !isUuid(chatId)) return null;
-    const safeTitle = sanitizeInput(title, 120);
-    if (!safeTitle) return null;
-
-    const { data, error } = await supabase
-      .from("chat_sessions")
-      .update({
-        title: safeTitle,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("user_id", userId)
-      .eq("id", chatId)
-      .select("id, title, created_at, updated_at")
-      .single();
-
-    if (error) throw error;
-
-    return {
-      chatId: data.id,
-      title: data.title || "New chat",
-      createdAt: new Date(data.created_at).getTime(),
-      updatedAt: new Date(data.updated_at).getTime(),
-    };
+    await saveSessions(userId, sessions);
+    return session;
   }
 
   async function deleteSession(userId, chatId) {
-    if (!chatId || !isUuid(chatId)) return;
-    const { error } = await supabase
-      .from("chat_sessions")
-      .delete()
-      .eq("user_id", userId)
-      .eq("id", chatId);
-
-    if (error) throw error;
-  }
-
-  async function resolveWritableSessionId(userId, chatId) {
-    if (chatId && chatId !== "default") {
-      const ensured = await ensureSession(userId, chatId);
-      return ensured?.chatId || null;
-    }
-
-    const latest = await fetchLatestSession(userId);
-    if (latest?.chatId) return latest.chatId;
-
-    const created = await createSession(userId, "New chat");
-    return created.chatId;
-  }
-
-  async function trimSessionMessages(userId, sessionId) {
-    const { data, error } = await supabase
-      .from("chat_messages")
-      .select("id")
-      .eq("user_id", userId)
-      .eq("session_id", sessionId)
-      .order("created_at", { ascending: false })
-      .range(maxHistoryLength, maxHistoryLength + 500);
-
-    if (error) throw error;
-    const idsToDelete = (data || []).map((row) => row.id);
-    if (!idsToDelete.length) return;
-
-    const { error: deleteError } = await supabase
-      .from("chat_messages")
-      .delete()
-      .in("id", idsToDelete);
-
-    if (deleteError) throw deleteError;
+    const sessions = await listSessions(userId);
+    const filtered = sessions.filter((session) => session.chatId !== chatId);
+    await saveSessions(userId, filtered);
+    await db.delete(createSessionMessagesKey(userId, chatId));
   }
 
   async function saveMessage(userId, role, message, chatId = "default") {
     try {
       const sanitizedMessage = sanitizeInput(message, maxMessageLength);
-      const sessionId = await resolveWritableSessionId(userId, chatId);
-      if (!sessionId || !sanitizedMessage) return null;
+      const key =
+        chatId === "default"
+          ? `chat_${userId}`
+          : createSessionMessagesKey(userId, chatId);
 
-      const { error } = await supabase.from("chat_messages").insert({
-        session_id: sessionId,
-        user_id: userId,
-        role,
-        content: sanitizedMessage,
-      });
+      const raw = await db.get(key);
+      const unwrapped = unwrap(raw);
+      const history = Array.isArray(unwrapped) ? unwrapped : [];
+      history.push({ role, message: sanitizedMessage, timestamp: Date.now() });
 
-      if (error) throw error;
+      if (history.length > maxHistoryLength) {
+        history.splice(0, history.length - maxHistoryLength);
+      }
 
-      await touchSession(userId, sessionId);
-      await trimSessionMessages(userId, sessionId);
-      return getChatHistory(userId, sessionId);
+      await db.set(key, history);
+      return history;
     } catch (err) {
       console.error("saveMessage error:", err);
       return null;
@@ -270,30 +143,13 @@ export function createHistoryService({ supabase, config }) {
 
   async function getChatHistory(userId, chatId = "default") {
     try {
-      let sessionId = chatId;
-      if (!sessionId || sessionId === "default" || !isUuid(sessionId)) {
-        const latest = await fetchLatestSession(userId);
-        sessionId = latest?.chatId || null;
-      }
-
-      if (!sessionId || !isUuid(sessionId)) return [];
-
-      const { data, error } = await supabase
-        .from("chat_messages")
-        .select("role, content, created_at")
-        .eq("user_id", userId)
-        .eq("session_id", sessionId)
-        .order("created_at", { ascending: true });
-
-      if (error) throw error;
-
-      return (data || []).map((item) => ({
-        role: item.role,
-        message: item.content,
-        timestamp: item.created_at
-          ? new Date(item.created_at).getTime()
-          : Date.now(),
-      }));
+      const key =
+        chatId === "default"
+          ? `chat_${userId}`
+          : createSessionMessagesKey(userId, chatId);
+      const raw = await db.get(key);
+      const history = unwrap(raw);
+      return Array.isArray(history) ? history : [];
     } catch (err) {
       console.error("getChatHistory error:", err);
       return [];
@@ -301,15 +157,20 @@ export function createHistoryService({ supabase, config }) {
   }
 
   async function forceCleanChat(userId, chatId = "default") {
-    const sessionId =
-      chatId === "default" ? (await fetchLatestSession(userId))?.chatId : chatId;
-    if (!sessionId || !isUuid(sessionId)) return [];
+    const key =
+      chatId === "default"
+        ? `chat_${userId}`
+        : createSessionMessagesKey(userId, chatId);
+    const history = await getChatHistory(userId, chatId);
 
-    const history = await getChatHistory(userId, sessionId);
     const deduped = [];
     for (const item of history) {
       const last = deduped[deduped.length - 1];
-      if (last && last.role === item.role && last.message === item.message) {
+      if (
+        last &&
+        last.role === item.role &&
+        last.message === item.message
+      ) {
         continue;
       }
       deduped.push(item);
@@ -320,28 +181,7 @@ export function createHistoryService({ supabase, config }) {
         ? deduped.slice(-cleanKeepRecent)
         : deduped;
 
-    const { error: deleteError } = await supabase
-      .from("chat_messages")
-      .delete()
-      .eq("user_id", userId)
-      .eq("session_id", sessionId);
-    if (deleteError) throw deleteError;
-
-    if (cleaned.length) {
-      const payload = cleaned.map((item) => ({
-        session_id: sessionId,
-        user_id: userId,
-        role: item.role,
-        content: sanitizeInput(item.message, maxMessageLength),
-        created_at: new Date(item.timestamp || Date.now()).toISOString(),
-      }));
-      const { error: insertError } = await supabase
-        .from("chat_messages")
-        .insert(payload);
-      if (insertError) throw insertError;
-    }
-
-    await touchSession(userId, sessionId);
+    await db.set(key, cleaned);
     return cleaned;
   }
 
@@ -354,10 +194,9 @@ export function createHistoryService({ supabase, config }) {
     listSessions,
     saveMessage,
     saveSessions,
-    sessionMessagesKey: (_userId, chatId) => chatId,
-    sessionsKey: (userId) => userId,
+    sessionMessagesKey: createSessionMessagesKey,
+    sessionsKey: createSessionsKey,
     touchSession,
-    updateSessionTitle,
-    unwrapDbData: (value) => value,
+    unwrapDbData: unwrap,
   };
 }
