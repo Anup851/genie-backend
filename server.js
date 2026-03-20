@@ -1,4 +1,4 @@
-﻿// server.js - Genie Backend (COMPLETE FIXED)
+// server.js - Genie Backend (COMPLETE FIXED)
 import crypto from "crypto";
 import express from "express";
 import fetch from "node-fetch";
@@ -26,6 +26,11 @@ const GEMINI_MEDIA_MODEL = String(
   .replace(/^models\//i, "");
 const GEMINI_API_VERSION = String(
   process.env.GEMINI_API_VERSION || "v1beta",
+).trim();
+const OPENROUTER_API_BASE = "https://openrouter.ai/api/v1";
+const OPENROUTER_MEDIA_MODEL = String(
+  process.env.OPENROUTER_MEDIA_MODEL ||
+    "nvidia/nemotron-nano-12b-v2-vl:free",
 ).trim();
 const DEEPAI_API_BASE = "https://api.deepai.org/api";
 const PORT = process.env.PORT || 3000;
@@ -265,6 +270,85 @@ async function callGeminiGenerateContent({
   throw err;
 }
 
+function extractOpenRouterText(data) {
+  const content = data?.choices?.[0]?.message?.content;
+  if (typeof content === "string") {
+    return content.trim();
+  }
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part) => {
+      if (typeof part?.text === "string") return part.text;
+      if (typeof part?.content === "string") return part.content;
+      return "";
+    })
+    .join("")
+    .trim();
+}
+
+async function callOpenRouterChatCompletion({
+  systemInstruction = "",
+  messages = [],
+  temperature = 0.1,
+  maxTokens = 4096,
+  model = OPENROUTER_MEDIA_MODEL,
+  plugins,
+  signal,
+}) {
+  const apiKey = String(
+    process.env.OPENROUTER_API_KEY || process.env.OPENAI_API_KEY || "",
+  ).trim();
+  if (!apiKey) {
+    const err = new Error("Missing OpenRouter API key");
+    err.code = "MISSING_OPENROUTER_API_KEY";
+    throw err;
+  }
+
+  const payload = {
+    model,
+    messages: [],
+    temperature,
+    max_tokens: maxTokens,
+  };
+
+  if (systemInstruction) {
+    payload.messages.push({
+      role: "system",
+      content: systemInstruction,
+    });
+  }
+
+  payload.messages.push(...messages);
+
+  if (Array.isArray(plugins) && plugins.length) {
+    payload.plugins = plugins;
+  }
+
+  const response = await fetch(`${OPENROUTER_API_BASE}/chat/completions`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+    signal,
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    const err = new Error(
+      `OpenRouter API error: ${response.status} model=${model}`,
+    );
+    err.status = response.status;
+    err.body = errorText;
+    err.model = model;
+    throw err;
+  }
+
+  const data = await response.json();
+  return extractOpenRouterText(data) || "No response.";
+}
+
 async function callDeepAiTextToImage(prompt, signal) {
   const apiKey = String(process.env.DEEPAI_API_KEY || "").trim();
   if (!apiKey) {
@@ -421,11 +505,14 @@ async function analyzeMediaHandler(req, res) {
   const userPrompt = String(prompt || defaultPrompt).trim() || defaultPrompt;
 
   try {
-    const geminiKeyPreview = process.env.GEMINI_API_KEY
-      ? `${process.env.GEMINI_API_KEY.slice(0, 10)}...${process.env.GEMINI_API_KEY.slice(-4)}`
+    const openRouterKey = String(
+      process.env.OPENROUTER_API_KEY || process.env.OPENAI_API_KEY || "",
+    ).trim();
+    const openRouterKeyPreview = openRouterKey
+      ? `${openRouterKey.slice(0, 10)}...${openRouterKey.slice(-4)}`
       : "MISSING";
     console.log(
-      `[KEY CHECK] route=/analyze-media provider=GEMINI key=${geminiKeyPreview} chatId=${activeChatId}`,
+      `[KEY CHECK] route=/analyze-media provider=OPENROUTER key=${openRouterKeyPreview} model=${OPENROUTER_MEDIA_MODEL} chatId=${activeChatId}`,
     );
 
     const dataUrlMatch = uploadData.match(
@@ -439,21 +526,34 @@ async function analyzeMediaHandler(req, res) {
     const base64Data = dataUrlMatch[2];
     const safeMediaName = String(mediaName || "uploaded-file").slice(0, 160);
 
-    if (!process.env.GEMINI_API_KEY) {
+    if (!openRouterKey) {
       return res.status(200).json({
         reply:
-          "Media analysis is not configured on backend. Add GEMINI_API_KEY in server secrets/env and try again.",
+          "Media analysis is not configured on backend. Add OPENROUTER_API_KEY in server secrets/env and try again.",
       });
     }
 
-    const userParts = [{ text: userPrompt }];
+    const userParts = [{ type: "text", text: userPrompt }];
+    const plugins = [];
+
     if (mimeType.startsWith("image/")) {
       userParts.push({
-        inlineData: { mimeType, data: base64Data },
+        type: "image_url",
+        image_url: {
+          url: uploadData,
+        },
       });
     } else if (mimeType === "application/pdf") {
       userParts.push({
-        inlineData: { mimeType, data: base64Data },
+        type: "file",
+        file: {
+          filename: safeMediaName,
+          file_data: uploadData,
+        },
+      });
+      plugins.push({
+        id: "file-parser",
+        pdf: { engine: "pdf-text" },
       });
     } else if (isTextLikeMime(mimeType)) {
       // For text-like uploads, inline text is more reliable than binary upload.
@@ -473,6 +573,7 @@ async function analyzeMediaHandler(req, res) {
 
       const clipped = decodedText.slice(0, 80000);
       userParts.push({
+        type: "text",
         text: `File: ${safeMediaName}\n\n${clipped}`,
       });
     } else {
@@ -484,12 +585,13 @@ async function analyzeMediaHandler(req, res) {
 
     const mediaMaxTokens = Number(process.env.MEDIA_MAX_TOKENS || 4096);
     const mediaTemperature = Number(process.env.MEDIA_TEMPERATURE || 0.1);
-    const rawReply = await callGeminiGenerateContent({
+    const rawReply = await callOpenRouterChatCompletion({
       systemInstruction: buildMediaSystemPrompt(mimeType),
-      contents: [{ role: "user", parts: userParts }],
+      messages: [{ role: "user", content: userParts }],
       temperature: mediaTemperature,
-      maxOutputTokens: mediaMaxTokens,
-      model: GEMINI_MEDIA_MODEL,
+      maxTokens: mediaMaxTokens,
+      model: OPENROUTER_MEDIA_MODEL,
+      plugins,
     });
 
     const reply = cleanAssistantReply(rawReply || "I could not analyze this file.");
@@ -521,8 +623,8 @@ async function analyzeMediaHandler(req, res) {
     if (err?.status === 404) {
       return res.status(200).json({
         reply:
-          `Media analysis model not found: \`${err.model || GEMINI_MODEL}\` for API \`${err.version || GEMINI_API_VERSION}\`. ` +
-          "Set GEMINI_MODEL to a valid model (for example `gemini-2.5-flash`) and retry.",
+          `Media analysis model not found: \`${err.model || OPENROUTER_MEDIA_MODEL}\` on OpenRouter. ` +
+          "Set OPENROUTER_MEDIA_MODEL to a valid model and retry.",
       });
     }
     return res.status(500).json({
