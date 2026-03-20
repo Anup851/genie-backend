@@ -271,6 +271,7 @@ export function createChatService({
     chatId = "default",
     message,
     promptEnvelope,
+    authToken,
     signal,
   }) {
     const sanitizedMessage = String(message || "").trim();
@@ -283,7 +284,7 @@ export function createChatService({
     const nowIST = getISTString();
     const newsContext = await getLiveNewsContext(sanitizedMessage);
 
-    let history = await getChatHistory(userId, chatId);
+    let history = await getChatHistory(userId, chatId, authToken);
     const sessionWarning = buildSessionWarning(history.length, sessionLimitWarning);
     if (sessionWarning?.limitReached) {
       return {
@@ -294,7 +295,7 @@ export function createChatService({
 
     const isFirstMessage = history.length === 0;
     if (prepareChatHistory(history).hasDuplicates) {
-      history = await forceCleanChat(userId, chatId);
+      history = await forceCleanChat(userId, chatId, authToken);
     }
 
     const promptContext = await buildStructuredChatPrompt({
@@ -319,13 +320,13 @@ export function createChatService({
 
     const reply = cleanAssistantReply(rawReply);
 
-    await saveMessage(userId, "user", sanitizedMessage, chatId);
-    await saveMessage(userId, "assistant", reply, chatId);
+    await saveMessage(userId, "user", sanitizedMessage, chatId, authToken);
+    await saveMessage(userId, "assistant", reply, chatId, authToken);
 
     if (isFirstMessage) {
-      await touchSession(userId, chatId, sanitizedMessage);
+      await touchSession(userId, chatId, sanitizedMessage, authToken);
     } else {
-      await touchSession(userId, chatId);
+      await touchSession(userId, chatId, null, authToken);
     }
 
     let finalReply = reply;

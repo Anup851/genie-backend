@@ -96,8 +96,6 @@ const CLEAN_KEEP_RECENT = 40;
 const SESSION_LIMIT_WARNING = 100;
 
 const historyService = createHistoryService({
-  db,
-  unwrapDbData: (value) => value,
   config: {
     maxSessions: MAX_SESSIONS,
     maxHistoryLength: MAX_HISTORY_LENGTH,
@@ -105,6 +103,8 @@ const historyService = createHistoryService({
     autoCleanThreshold: AUTO_CLEAN_THRESHOLD,
     cleanKeepRecent: CLEAN_KEEP_RECENT,
   },
+  supabaseUrl: SUPABASE_URL,
+  supabaseAnonKey: SUPABASE_ANON_KEY,
 });
 
 const sarvamService = createSarvamService({
@@ -126,16 +126,17 @@ console.log("[BOOT] Sarvam remains the final model provider for normal chat");
 
 const {
   createSession,
+  deleteAllSessions,
+  deleteSession,
   ensureSession,
   forceCleanChat,
   getChatHistory,
+  getChatStats,
   listSessions,
+  rollbackLastAssistantReply,
   saveMessage,
-  saveSessions,
-  sessionsKey,
-  sessionMessagesKey,
   touchSession,
-  unwrapDbData,
+  updateSessionTitle,
 } = historyService;
 
 // ============================================================
@@ -324,7 +325,7 @@ async function supabaseAuthRequired(req, res, next) {
     return res.status(401).json({ error: "Unauthorized" });
   }
 
-  req.auth = { sub: data.user.id, email: data.user.email || null };
+  req.auth = { sub: data.user.id, email: data.user.email || null, token };
   next();
 }
 
@@ -375,34 +376,38 @@ app.get("/api/news", async (req, res) => {
 // Create new session
 app.post("/chat/new", supabaseAuthRequired, async (req, res) => {
   const userId = req.auth?.sub;
+  const authToken = req.auth?.token;
   const { title } = req.body || {};
   if (!userId) return res.status(400).json({ error: "Invalid userId" });
 
-  const session = await createSession(userId, title || "New chat");
+  const session = await createSession(userId, title || "New chat", authToken);
   res.json(session);
 });
 
 // List sessions
 app.get("/chats/:userId", supabaseAuthRequired, async (req, res) => {
   const userId = req.auth?.sub;
+  const authToken = req.auth?.token;
   if (!userId) return res.status(400).json({ error: "Invalid userId" });
 
-  const sessions = await listSessions(userId);
+  const sessions = await listSessions(userId, authToken);
   res.json({ sessions });
 });
 
 // Get chat messages
 app.get("/chat/:userId/:chatId", supabaseAuthRequired, async (req, res) => {
   const userId = req.auth?.sub;
+  const authToken = req.auth?.token;
   const { chatId } = req.params;
   if (!userId) return res.status(400).json({ error: "Invalid userId" });
 
-  const messages = await getChatHistory(userId, chatId);
+  const messages = await getChatHistory(userId, chatId, authToken);
   res.json({ chatId, messages });
 });
 
 async function analyzeMediaHandler(req, res) {
   const userId = req.auth?.sub;
+  const authToken = req.auth?.token;
   const { prompt, mediaData, imageData, mediaName, mediaType, chatId } =
     req.body || {};
   const activeChatId = chatId || "default";
@@ -494,16 +499,17 @@ async function analyzeMediaHandler(req, res) {
       "user",
       `[Media: ${mimeType}] ${userPrompt}`,
       activeChatId,
+      authToken,
     );
-    await saveMessage(userId, "assistant", reply, activeChatId);
+    await saveMessage(userId, "assistant", reply, activeChatId, authToken);
 
-    const history = await getChatHistory(userId, activeChatId);
+    const history = await getChatHistory(userId, activeChatId, authToken);
     const isFirstMessage = history.length <= 2;
 
     if (isFirstMessage) {
-      await touchSession(userId, activeChatId, userPrompt);
+      await touchSession(userId, activeChatId, userPrompt, authToken);
     } else {
-      await touchSession(userId, activeChatId);
+      await touchSession(userId, activeChatId, null, authToken);
     }
 
     return res.json({
@@ -530,6 +536,7 @@ app.post("/analyze-image", supabaseAuthRequired, analyzeMediaHandler);
 
 app.post("/generate-image", supabaseAuthRequired, async (req, res) => {
   const userId = req.auth?.sub;
+  const authToken = req.auth?.token;
   const { prompt, chatId } = req.body || {};
   const activeChatId = chatId || "default";
   const userPrompt = String(prompt || "").trim();
@@ -550,15 +557,15 @@ app.post("/generate-image", supabaseAuthRequired, async (req, res) => {
     const result = await callDeepAiTextToImage(userPrompt);
     const reply = `Generated image for: "${userPrompt}"\n${result.imageUrl}`;
 
-    await saveMessage(userId, "user", userPrompt, activeChatId);
-    await saveMessage(userId, "assistant", reply, activeChatId);
+    await saveMessage(userId, "user", userPrompt, activeChatId, authToken);
+    await saveMessage(userId, "assistant", reply, activeChatId, authToken);
 
-    const history = await getChatHistory(userId, activeChatId);
+    const history = await getChatHistory(userId, activeChatId, authToken);
     const isFirstMessage = history.length <= 2;
     if (isFirstMessage) {
-      await touchSession(userId, activeChatId, userPrompt);
+      await touchSession(userId, activeChatId, userPrompt, authToken);
     } else {
-      await touchSession(userId, activeChatId);
+      await touchSession(userId, activeChatId, null, authToken);
     }
 
     return res.json({
@@ -588,6 +595,7 @@ app.post("/generate-image", supabaseAuthRequired, async (req, res) => {
 // Save client-side/manual replies (e.g., weather special command) into chat history.
 app.post("/chat/manual", supabaseAuthRequired, async (req, res) => {
   const userId = req.auth?.sub;
+  const authToken = req.auth?.token;
   const { message, reply, chatId } = req.body || {};
   const activeChatId = chatId || "default";
 
@@ -596,15 +604,15 @@ app.post("/chat/manual", supabaseAuthRequired, async (req, res) => {
   }
 
   try {
-    await saveMessage(userId, "user", String(message).trim(), activeChatId);
-    await saveMessage(userId, "assistant", String(reply).trim(), activeChatId);
+    await saveMessage(userId, "user", String(message).trim(), activeChatId, authToken);
+    await saveMessage(userId, "assistant", String(reply).trim(), activeChatId, authToken);
 
-    const history = await getChatHistory(userId, activeChatId);
+    const history = await getChatHistory(userId, activeChatId, authToken);
     const isFirstMessage = history.length <= 2;
     if (isFirstMessage) {
-      await touchSession(userId, activeChatId, String(message).trim());
+      await touchSession(userId, activeChatId, String(message).trim(), authToken);
     } else {
-      await touchSession(userId, activeChatId);
+      await touchSession(userId, activeChatId, null, authToken);
     }
 
     return res.json({ ok: true });
@@ -617,6 +625,7 @@ app.post("/chat/manual", supabaseAuthRequired, async (req, res) => {
 // Roll back last assistant reply for a just-cancelled request.
 app.post("/chat/rollback-last", supabaseAuthRequired, async (req, res) => {
   const userId = req.auth?.sub;
+  const authToken = req.auth?.token;
   const { chatId, userMessage } = req.body || {};
   const activeChatId = chatId || "default";
   const expectedUser = String(userMessage || "").trim();
@@ -625,27 +634,13 @@ app.post("/chat/rollback-last", supabaseAuthRequired, async (req, res) => {
   }
 
   try {
-    const key =
-      activeChatId === "default"
-        ? `chat_${userId}`
-        : sessionMessagesKey(userId, activeChatId);
-    const raw = await db.get(key);
-    const history = Array.isArray(unwrapDbData(raw)) ? unwrapDbData(raw) : [];
-    if (history.length < 2) return res.json({ ok: true, removed: false });
-
-    const last = history[history.length - 1];
-    const prev = history[history.length - 2];
-    if (
-      last?.role === "assistant" &&
-      prev?.role === "user" &&
-      String(prev?.message || "").trim() === expectedUser
-    ) {
-      history.pop(); // remove only assistant reply, keep user prompt
-      await db.set(key, history);
-      return res.json({ ok: true, removed: true });
-    }
-
-    return res.json({ ok: true, removed: false });
+    const result = await rollbackLastAssistantReply(
+      userId,
+      activeChatId,
+      expectedUser,
+      authToken,
+    );
+    return res.json(result);
   } catch (err) {
     console.error("❌ /chat/rollback-last error:", err);
     return res.status(500).json({ error: "Failed to rollback message" });
@@ -657,6 +652,7 @@ app.post("/chat/rollback-last", supabaseAuthRequired, async (req, res) => {
 
 app.post("/chat", supabaseAuthRequired, async (req, res) => {
   const userId = req.auth?.sub;
+  const authToken = req.auth?.token;
   const { message, chatId, promptEnvelope } = req.body || {};
   const activeChatId = chatId || "default";
   let clientDisconnected = false;
@@ -703,6 +699,7 @@ app.post("/chat", supabaseAuthRequired, async (req, res) => {
       chatId: activeChatId,
       message,
       promptEnvelope,
+      authToken,
       signal: controller.signal,
     });
 
@@ -736,9 +733,10 @@ app.post(
   supabaseAuthRequired,
   async (req, res) => {
     const userId = req.auth?.sub;
+    const authToken = req.auth?.token;
     const { chatId } = req.params;
     try {
-      const cleaned = await forceCleanChat(userId, chatId);
+      const cleaned = await forceCleanChat(userId, chatId, authToken);
       res.json({
         success: true,
         message: `Chat cleaned to ${cleaned.length} messages`,
@@ -756,6 +754,7 @@ app.post(
 
 app.delete("/chat/:userId/:chatId", supabaseAuthRequired, async (req, res) => {
   const userId = req.auth?.sub;
+  const authToken = req.auth?.token;
   const { chatId } = req.params;
   if (!userId || !chatId) {
     return res.status(400).json({ error: "Invalid userId or chatId" });
@@ -763,18 +762,14 @@ app.delete("/chat/:userId/:chatId", supabaseAuthRequired, async (req, res) => {
 
   try {
     console.log(`ðŸ—‘ï¸ Deleting chat ${chatId} for user ${userId}`);
-    const messagesKey = sessionMessagesKey(userId, chatId);
-    await db.delete(messagesKey);
-
-    const sessions = await listSessions(userId);
-    const filteredSessions = sessions.filter((s) => s.chatId !== chatId);
-    await saveSessions(userId, filteredSessions);
+    await deleteSession(userId, chatId, authToken);
+    const sessions = await listSessions(userId, authToken);
 
     console.log(`âœ… Chat ${chatId} deleted successfully`);
     res.json({
       ok: true,
       message: "Chat deleted successfully",
-      remainingSessions: filteredSessions.length,
+      remainingSessions: sessions.length,
     });
   } catch (err) {
     console.error("âŒ Delete session error:", err);
@@ -789,6 +784,7 @@ app.put(
   supabaseAuthRequired,
   async (req, res) => {
     const userId = req.auth?.sub;
+    const authToken = req.auth?.token;
     const { chatId } = req.params;
     const title = String(req.body?.title || "")
       .trim()
@@ -800,16 +796,10 @@ app.put(
       return res.status(400).json({ error: "Invalid title" });
     }
     try {
-      const sessions = await listSessions(userId);
-      const idx = sessions.findIndex((s) => s.chatId === chatId);
-      if (idx === -1) {
+      const session = await updateSessionTitle(userId, chatId, title, authToken);
+      if (!session) {
         return res.status(404).json({ error: "Chat not found" });
       }
-      sessions[idx].title = title;
-      sessions[idx].updatedAt = Date.now();
-      const [session] = sessions.splice(idx, 1);
-      sessions.unshift(session);
-      await saveSessions(userId, sessions);
       return res.json({ success: true, chatId, title });
     } catch (err) {
       console.error("❌ Error updating chat title:", err);
@@ -820,35 +810,19 @@ app.put(
 
 app.delete("/chats/:userId", supabaseAuthRequired, async (req, res) => {
   const userId = req.auth?.sub;
+  const authToken = req.auth?.token;
   if (!userId) {
     return res.status(400).json({ error: "Invalid userId" });
   }
 
   try {
     console.log(`ðŸ—‘ï¸ Deleting ALL chats for user ${userId}`);
-    const sessions = await listSessions(userId);
-    console.log(`Found ${sessions.length} sessions to delete`);
-
-    for (const s of sessions) {
-      try {
-        const key = sessionMessagesKey(userId, s.chatId);
-        await db.delete(key);
-        console.log(`  âœ… Deleted messages: ${s.chatId}`);
-      } catch (err) {
-        console.error(`  âŒ Failed to delete ${s.chatId}:`, err.message);
-      }
-    }
-
-    await db.set(sessionsKey(userId), []);
-    try {
-      await db.delete(`chat_${userId}`);
-    } catch (err) {}
-
-    console.log(`âœ… All ${sessions.length} chats deleted successfully`);
+    const deleted = await deleteAllSessions(userId, authToken);
+    console.log(`âœ… All ${deleted} chats deleted successfully`);
     res.json({
       ok: true,
-      deleted: sessions.length,
-      message: `Successfully deleted ${sessions.length} chats`,
+      deleted,
+      message: `Successfully deleted ${deleted} chats`,
     });
   } catch (err) {
     console.error("âŒ Delete all chats error:", err);
@@ -863,15 +837,15 @@ app.get(
   supabaseAuthRequired,
   async (req, res) => {
     const userId = req.auth?.sub;
+    const authToken = req.auth?.token;
     const { chatId } = req.params;
     try {
-      const messagesKey = sessionMessagesKey(userId, chatId);
-      const messages = await db.get(messagesKey);
-      const sessions = await listSessions(userId);
+      const messages = await getChatHistory(userId, chatId, authToken);
+      const sessions = await listSessions(userId, authToken);
       const sessionExists = sessions.some((s) => s.chatId === chatId);
       res.json({
         chatId,
-        messagesExist: messages !== null,
+        messagesExist: Array.isArray(messages) && messages.length > 0,
         sessionExists,
         sessionsCount: sessions.length,
       });
@@ -886,30 +860,10 @@ app.get(
   supabaseAuthRequired,
   async (req, res) => {
     const userId = req.auth?.sub;
+    const authToken = req.auth?.token;
     const { chatId } = req.params;
     try {
-      const key = sessionMessagesKey(userId, chatId);
-      const raw = await db.get(key);
-      const history = Array.isArray(unwrapDbData(raw)) ? unwrapDbData(raw) : [];
-
-      let duplicateCount = 0;
-      for (let i = 1; i < history.length; i++) {
-        if (
-          history[i].role === history[i - 1].role &&
-          history[i].message === history[i - 1].message
-        ) {
-          duplicateCount++;
-        }
-      }
-
-      res.json({
-        totalMessages: history.length,
-        duplicateCount,
-        needsCleaning:
-          history.length > AUTO_CLEAN_THRESHOLD || duplicateCount > 0,
-        autoCleanThreshold: AUTO_CLEAN_THRESHOLD,
-        maxLimit: MAX_HISTORY_LENGTH,
-      });
+      res.json(await getChatStats(userId, chatId, authToken));
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
