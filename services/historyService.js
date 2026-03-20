@@ -55,6 +55,17 @@ export function createHistoryService({ config, supabaseUrl, supabaseAnonKey }) {
     });
   }
 
+  function logDbError(context, error, meta = {}) {
+    if (!error) return;
+    console.error(`[historyService] ${context} failed`, {
+      message: error.message,
+      details: error.details,
+      hint: error.hint,
+      code: error.code,
+      ...meta,
+    });
+  }
+
   async function listSessions(userId, authToken) {
     const client = getAuthedClient(authToken);
     const { data, error } = await client
@@ -159,41 +170,60 @@ export function createHistoryService({ config, supabaseUrl, supabaseAnonKey }) {
   }
 
   async function saveMessage(userId, role, message, chatId = "default", authToken) {
-    try {
-      const sanitizedMessage = sanitizeInput(message, maxMessageLength);
-      if (!sanitizedMessage || !chatId || chatId === "default") return [];
+    const sanitizedMessage = sanitizeInput(message, maxMessageLength);
+    if (!sanitizedMessage || !chatId || chatId === "default") return [];
 
-      await ensureSession(userId, chatId, authToken);
-      const client = getAuthedClient(authToken);
-      const { error } = await client.from("chat_messages").insert({
+    await ensureSession(userId, chatId, authToken);
+    const client = getAuthedClient(authToken);
+    const { data, error } = await client
+      .from("chat_messages")
+      .insert({
         session_id: chatId,
         user_id: userId,
         role,
         message: sanitizedMessage,
+      })
+      .select("id, role, message, created_at")
+      .single();
+
+    if (error) {
+      logDbError("saveMessage.insert", error, {
+        userId,
+        chatId,
+        role,
       });
+      throw error;
+    }
 
-      if (error) throw error;
-
-      const history = await getChatHistory(userId, chatId, authToken);
-      if (history.length > maxHistoryLength) {
-        const rowsToDelete = history.slice(0, history.length - maxHistoryLength);
-        const ids = rowsToDelete.map((item) => item.id).filter(Boolean);
-        if (ids.length) {
-          const { error: deleteError } = await client
-            .from("chat_messages")
-            .delete()
-            .in("id", ids)
-            .eq("user_id", userId)
-            .eq("session_id", chatId);
-          if (deleteError) throw deleteError;
+    const history = await getChatHistory(userId, chatId, authToken);
+    if (history.length > maxHistoryLength) {
+      const rowsToDelete = history.slice(0, history.length - maxHistoryLength);
+      const ids = rowsToDelete.map((item) => item.id).filter(Boolean);
+      if (ids.length) {
+        const { error: deleteError } = await client
+          .from("chat_messages")
+          .delete()
+          .in("id", ids)
+          .eq("user_id", userId)
+          .eq("session_id", chatId);
+        if (deleteError) {
+          logDbError("saveMessage.trimHistory", deleteError, {
+            userId,
+            chatId,
+            deleteCount: ids.length,
+          });
+          throw deleteError;
         }
       }
-
-      return getChatHistory(userId, chatId, authToken);
-    } catch (err) {
-      console.error("saveMessage error:", err);
-      return null;
     }
+
+    return [
+      ...history.filter((item) => item.id !== data.id),
+      {
+        ...mapMessage(data),
+        id: data.id,
+      },
+    ];
   }
 
   async function getChatHistory(userId, chatId = "default", authToken) {
