@@ -32,6 +32,10 @@ const OPENROUTER_MEDIA_MODEL = String(
   process.env.OPENROUTER_MEDIA_MODEL ||
     "nvidia/nemotron-nano-12b-v2-vl:free",
 ).trim();
+const OPENROUTER_MEDIA_TIMEOUT_MS = Math.max(
+  10000,
+  Number(process.env.OPENROUTER_MEDIA_TIMEOUT_MS || 60000),
+);
 const DEEPAI_API_BASE = "https://api.deepai.org/api";
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL =
@@ -290,7 +294,7 @@ async function callOpenRouterChatCompletion({
   systemInstruction = "",
   messages = [],
   temperature = 0.1,
-  maxTokens = 4096,
+  maxTokens = 1200,
   model = OPENROUTER_MEDIA_MODEL,
   plugins,
   signal,
@@ -324,15 +328,46 @@ async function callOpenRouterChatCompletion({
     payload.plugins = plugins;
   }
 
-  const response = await fetch(`${OPENROUTER_API_BASE}/chat/completions`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(payload),
-    signal,
-  });
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(),
+    OPENROUTER_MEDIA_TIMEOUT_MS,
+  );
+  const abortHandler = () => controller.abort();
+
+  if (signal) {
+    if (signal.aborted) {
+      controller.abort();
+    } else {
+      signal.addEventListener("abort", abortHandler, { once: true });
+    }
+  }
+
+  let response;
+  try {
+    response = await fetch(`${OPENROUTER_API_BASE}/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    if (controller.signal.aborted) {
+      const timeoutErr = new Error("OpenRouter media request timed out");
+      timeoutErr.code = "OPENROUTER_TIMEOUT";
+      timeoutErr.status = 504;
+      throw timeoutErr;
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+    if (signal) {
+      signal.removeEventListener("abort", abortHandler);
+    }
+  }
 
   if (!response.ok) {
     const errorText = await response.text();
@@ -583,7 +618,7 @@ async function analyzeMediaHandler(req, res) {
       });
     }
 
-    const mediaMaxTokens = Number(process.env.MEDIA_MAX_TOKENS || 4096);
+    const mediaMaxTokens = Number(process.env.MEDIA_MAX_TOKENS || 1200);
     const mediaTemperature = Number(process.env.MEDIA_TEMPERATURE || 0.1);
     const rawReply = await callOpenRouterChatCompletion({
       systemInstruction: buildMediaSystemPrompt(mimeType),
@@ -620,6 +655,12 @@ async function analyzeMediaHandler(req, res) {
     });
   } catch (err) {
     console.error("/analyze-media error:", err);
+    if (err?.code === "OPENROUTER_TIMEOUT" || err?.status === 504) {
+      return res.status(200).json({
+        reply:
+          "Media analysis timed out on OpenRouter. Try a smaller file, a shorter prompt, or set a faster model.",
+      });
+    }
     if (err?.status === 404) {
       return res.status(200).json({
         reply:
@@ -628,7 +669,10 @@ async function analyzeMediaHandler(req, res) {
       });
     }
     return res.status(500).json({
-      reply: "Sorry, an error occurred while analyzing the file.",
+      reply:
+        err?.body && String(err.body).trim()
+          ? `Media analysis failed: ${String(err.body).slice(0, 300)}`
+          : "Sorry, an error occurred while analyzing the file.",
     });
   }
 }
