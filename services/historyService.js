@@ -273,10 +273,43 @@ export function createHistoryService({ config, supabaseUrl, supabaseAnonKey }) {
       throw error;
     }
 
-    const history = await getChatHistory(userId, chatId, authToken);
-    if (history.length > maxHistoryLength) {
-      const rowsToDelete = history.slice(0, history.length - maxHistoryLength);
-      const ids = rowsToDelete.map((item) => item.id).filter(Boolean);
+    const { count, error: countError } = await client
+      .from("chat_messages")
+      .select("id", { count: "exact", head: true })
+      .eq("user_id", userId)
+      .eq("session_id", chatId);
+
+    if (countError) {
+      logDbError("saveMessage.countHistory", countError, {
+        userId,
+        chatId,
+      });
+      throw countError;
+    }
+
+    const overflowCount = Math.max(0, Number(count || 0) - maxHistoryLength);
+    if (overflowCount > 0) {
+      const { data: overflowRows, error: overflowError } = await client
+        .from("chat_messages")
+        .select("id")
+        .eq("user_id", userId)
+        .eq("session_id", chatId)
+        .order("created_at", { ascending: true })
+        .limit(overflowCount);
+
+      if (overflowError) {
+        logDbError("saveMessage.fetchOverflow", overflowError, {
+          userId,
+          chatId,
+          overflowCount,
+        });
+        throw overflowError;
+      }
+
+      const ids = Array.isArray(overflowRows)
+        ? overflowRows.map((item) => item.id).filter(Boolean)
+        : [];
+
       if (ids.length) {
         const { error: deleteError } = await client
           .from("chat_messages")
@@ -296,7 +329,6 @@ export function createHistoryService({ config, supabaseUrl, supabaseAnonKey }) {
     }
 
     return [
-      ...history.filter((item) => item.id !== data.id),
       {
         ...mapMessage(data),
         id: data.id,

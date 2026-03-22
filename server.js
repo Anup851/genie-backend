@@ -1,4 +1,4 @@
-// server.js - Genie Backend (COMPLETE FIXED)
+﻿// server.js - Genie Backend (COMPLETE FIXED)
 import crypto from "crypto";
 import express from "express";
 import fetch from "node-fetch";
@@ -47,10 +47,11 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
 });
 
-// --- Check API Key ---
-if (!process.env.SARVAM_API_KEY) {
-  console.error("âŒ SARVAM_API_KEY is missing in .env!");
-  process.exit(1);
+const hasSarvamApiKey = !!String(process.env.SARVAM_API_KEY || "").trim();
+if (!hasSarvamApiKey) {
+  console.warn(
+    "[BOOT] SARVAM_API_KEY is missing. Normal /chat will be unavailable, but media analysis can still run.",
+  );
 }
 
 // --- Simple Rate Limiting ---
@@ -116,9 +117,18 @@ const historyService = createHistoryService({
   supabaseAnonKey: SUPABASE_ANON_KEY,
 });
 
-const sarvamService = createSarvamService({
-  apiKey: process.env.SARVAM_API_KEY,
-});
+const sarvamService = hasSarvamApiKey
+  ? createSarvamService({
+      apiKey: process.env.SARVAM_API_KEY,
+    })
+  : {
+      async sendChatMessages() {
+        const err = new Error("SARVAM_API_KEY is missing");
+        err.code = "SARVAM_NOT_CONFIGURED";
+        err.status = 503;
+        throw err;
+      },
+    };
 
 const chatService = createChatService({
   historyService,
@@ -863,7 +873,10 @@ app.post("/chat", supabaseAuthRequired, async (req, res) => {
   } catch (err) {
     console.error("âŒ /chat error:", err);
     let reply = "Sorry, an error occurred.";
-    if (err.name === "AbortError") {
+    if (err?.code === "SARVAM_NOT_CONFIGURED" || err?.status === 503) {
+      reply =
+        "Normal chat is not configured yet. Add SARVAM_API_KEY for /chat, or use media upload with OpenRouter.";
+    } else if (err.name === "AbortError") {
       reply = "Request timeout. Try a smaller request.";
     }
     res.status(500).json({ reply });
