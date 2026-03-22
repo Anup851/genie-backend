@@ -271,6 +271,7 @@ export function createChatService({
     chatId = "default",
     message,
     promptEnvelope,
+    forceCodeMode = false,
     authToken,
     signal,
   }) {
@@ -280,7 +281,9 @@ export function createChatService({
         ? promptEnvelope.trim().slice(0, 40000)
         : sanitizedMessage;
 
-    const optimizedParams = buildChatParams(sanitizedMessage, maxResponseTokens);
+    const optimizedParams = buildChatParams(sanitizedMessage, maxResponseTokens, {
+      forceCodeMode,
+    });
     const nowIST = getISTString();
     const newsContext = await getLiveNewsContext(sanitizedMessage);
 

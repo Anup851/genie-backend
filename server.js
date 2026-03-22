@@ -809,8 +809,9 @@ app.post("/chat/rollback-last", supabaseAuthRequired, async (req, res) => {
 app.post("/chat", supabaseAuthRequired, async (req, res) => {
   const userId = req.auth?.sub;
   const authToken = req.auth?.token;
-  const { message, chatId, promptEnvelope } = req.body || {};
+  const { message, chatId, promptEnvelope, clientContextMeta } = req.body || {};
   const activeChatId = chatId || "default";
+  const forceCodeMode = !!clientContextMeta?.forceCodeMode;
   let clientDisconnected = false;
   req.on("close", () => {
     clientDisconnected = true;
@@ -855,6 +856,7 @@ app.post("/chat", supabaseAuthRequired, async (req, res) => {
       chatId: activeChatId,
       message,
       promptEnvelope,
+      forceCodeMode,
       authToken,
       signal: controller.signal,
     });

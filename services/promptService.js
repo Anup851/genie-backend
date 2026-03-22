@@ -1,12 +1,12 @@
 import { AIMessage, HumanMessage } from "@langchain/core/messages";
 import { ChatPromptTemplate, MessagesPlaceholder } from "@langchain/core/prompts";
 
-export function buildChatParams(message, maxResponseTokens = 4000) {
-  const isCodeHeavy = isCodeHeavyMessage(message);
+export function buildChatParams(message, maxResponseTokens = 4000, options = {}) {
+  const isCodeHeavy = options.forceCodeMode || isCodeHeavyMessage(message);
   return {
     isCodeHeavy,
-    maxTokens: isCodeHeavy ? maxResponseTokens : 1000,
-    timeout: isCodeHeavy ? 60000 : 30000,
+    maxTokens: isCodeHeavy ? maxResponseTokens : 1600,
+    timeout: isCodeHeavy ? 75000 : 40000,
     historyLimit: isCodeHeavy ? 8 : 12,
     temperature: isCodeHeavy ? 0.25 : 0.6,
   };
@@ -112,9 +112,34 @@ function isCodeHeavyMessage(message) {
   if (!message || typeof message !== "string") return false;
   const trimmed = message.trim();
   if (trimmed.includes("```")) return true;
+
+  const normalized = trimmed.toLowerCase();
   const codePatterns = [
     /(function|def|class|import|export|const|let|var)\b/,
     /(if|else|for|while|return|try|catch|finally)\b/,
+    /\b(html|css|javascript|js|jsx|typescript|ts|python|java|c\+\+|cpp|react|node|express)\b/,
+    /\b(code|coding|script|snippet|program|algorithm|app|project|component|function)\b/,
+    /\b(index\.html|styles?\.css|script\.js|app\.js|main\.js|main\.py)\b/,
+    /\b(full|complete|entire|again|rewrite|regenerate|continue|rest of)\b.*\b(code|html|css|js|javascript|file|files)\b/,
+    /\b(split|separate)\b.*\b(file|files)\b/,
   ];
-  return codePatterns.some((pattern) => pattern.test(trimmed));
+
+  if (codePatterns.some((pattern) => pattern.test(trimmed))) return true;
+
+  const requestPhrases = [
+    "give code",
+    "send code",
+    "write code",
+    "give html",
+    "give css",
+    "give js",
+    "send html",
+    "send css",
+    "send js",
+    "complete code",
+    "full code",
+    "code again",
+  ];
+
+  return requestPhrases.some((phrase) => normalized.includes(phrase));
 }
