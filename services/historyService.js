@@ -30,6 +30,84 @@ function mapMessage(row) {
   };
 }
 
+function toTitleCase(text = "") {
+  return String(text || "")
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
+}
+
+function limitWords(text = "", maxWords = 5) {
+  return String(text || "")
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, maxWords)
+    .join(" ");
+}
+
+function clipTitle(text = "", maxLength = 48) {
+  const value = String(text || "").trim();
+  if (value.length <= maxLength) return value;
+  const clipped = value.slice(0, maxLength);
+  return clipped.slice(0, clipped.lastIndexOf(" ")) || clipped;
+}
+
+function summarizeSessionTitle(input = "") {
+  const cleaned = String(input || "")
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/https?:\/\/\S+/g, " ")
+    .replace(/[#>*_\-\[\]\(\)]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!cleaned) return "New chat";
+
+  const lower = cleaned.toLowerCase();
+  const buildLike = [
+    /^write code for\s+/i,
+    /^write code to\s+/i,
+    /^build\s+/i,
+    /^create\s+/i,
+    /^make\s+/i,
+    /^generate\s+/i,
+  ];
+
+  const suffixRules = [
+    { pattern: /^summari[sz]e\s+(?:this\s+|the\s+|an?\s+|my\s+)?/i, suffix: "Summary" },
+    { pattern: /^explain\s+(?:this\s+|the\s+|an?\s+|my\s+)?/i, suffix: "Explanation" },
+    { pattern: /^brainstorm\s+(?:ideas?\s+for\s+|for\s+)?/i, suffix: "Ideas" },
+    { pattern: /^(?:make|create)\s+(?:a\s+)?plan\s+(?:for\s+|to\s+)?/i, suffix: "Plan" },
+  ];
+
+  for (const { pattern, suffix } of suffixRules) {
+    if (pattern.test(lower)) {
+      const core = cleaned
+        .replace(pattern, "")
+        .split(/\b(?:with|using|and|for|in)\b/i)[0]
+        .trim();
+      const title = `${toTitleCase(limitWords(core || "Chat", 4))} ${suffix}`.trim();
+      return clipTitle(title) || "New chat";
+    }
+  }
+
+  for (const pattern of buildLike) {
+    if (pattern.test(lower)) {
+      const core = cleaned
+        .replace(pattern, "")
+        .split(/\b(?:with|using|and|for|in|that)\b/i)[0]
+        .trim();
+      return clipTitle(toTitleCase(limitWords(core || "New chat", 5))) || "New chat";
+    }
+  }
+
+  const fallback = cleaned
+    .split(/[.!?\n]/)[0]
+    .trim();
+  return clipTitle(toTitleCase(limitWords(fallback, 6))) || "New chat";
+}
+
 export function createHistoryService({ config, supabaseUrl, supabaseAnonKey }) {
   const {
     maxSessions,
@@ -124,7 +202,7 @@ export function createHistoryService({ config, supabaseUrl, supabaseAnonKey }) {
     let session = await ensureSession(userId, chatId, authToken);
     if (!session) return null;
 
-    const nextTitle = String(titleIfEmpty || "").trim();
+    const nextTitle = summarizeSessionTitle(titleIfEmpty);
     const updates = {};
     if (nextTitle && (!session.title || session.title === "New chat")) {
       updates.title = nextTitle.slice(0, 120);
