@@ -323,8 +323,10 @@ export function createChatService({
 
     const reply = cleanAssistantReply(rawReply);
 
-    await saveMessage(userId, "user", sanitizedMessage, chatId, authToken);
-    await saveMessage(userId, "assistant", reply, chatId, authToken);
+    await Promise.all([
+      saveMessage(userId, "user", sanitizedMessage, chatId, authToken),
+      saveMessage(userId, "assistant", reply, chatId, authToken),
+    ]);
 
     if (isFirstMessage) {
       await touchSession(userId, chatId, sanitizedMessage, authToken);
