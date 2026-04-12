@@ -1,9 +1,11 @@
-﻿// server.js - Genie Backend (COMPLETE FIXED)
+// server.js - Genie Backend (COMPLETE FIXED)
 import crypto from "crypto";
 import express from "express";
 import fetch from "node-fetch";
 import cors from "cors";
 import dotenv from "dotenv";
+import path from "path";
+import { fileURLToPath } from "url";
 import { createClient } from "@supabase/supabase-js";
 import { createChatService, fetchGdeltArticles } from "./services/chatService.js";
 import { createKeyValueStore } from "./services/dataStore.js";
@@ -14,6 +16,8 @@ import { cleanAssistantReply } from "./utils/messageFormatter.js";
 dotenv.config({ quiet: true });
 
 // --- Initialize ---
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 const db = createKeyValueStore();
 const app = express();
 const GEMINI_MODEL = String(process.env.GEMINI_MODEL || "gemini-2.5-flash")
@@ -79,6 +83,7 @@ function checkRateLimit(userId) {
 app.use(express.json({ limit: "20mb" }));
 app.use(express.urlencoded({ extended: true }));
 app.use(cors());
+app.use(express.static(__dirname));
 
 // --- CORS Headers ---
 app.use((req, res, next) => {
@@ -463,6 +468,14 @@ async function supabaseAuthRequired(req, res, next) {
 // ============================================================
 
 app.get("/", (req, res) => {
+  res.sendFile(path.join(__dirname, "index.html"));
+});
+
+app.get("/auth", (req, res) => {
+  res.sendFile(path.join(__dirname, "auth.html"));
+});
+
+app.get("/api/health", (req, res) => {
   res.json({
     status: "âœ… Genie Backend (COMPLETE FIXED)",
     timestamp: new Date().toISOString(),
