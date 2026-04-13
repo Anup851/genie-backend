@@ -323,6 +323,10 @@ export function createChatService({
 
     const reply = cleanAssistantReply(rawReply);
 
+    if (chatId && chatId !== "default") {
+      await historyService.ensureSession(userId, chatId, authToken);
+    }
+
     await Promise.all([
       saveMessage(userId, "user", sanitizedMessage, chatId, authToken),
       saveMessage(userId, "assistant", reply, chatId, authToken),
