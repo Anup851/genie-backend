@@ -1,5 +1,7 @@
 import fetch from "node-fetch";
 
+const SARVAM_STARTER_MAX_TOKENS = 2048;
+
 function getMessageText(content) {
   if (typeof content === "string") return content.trim();
   if (Array.isArray(content)) {
@@ -73,6 +75,19 @@ export function createSarvamService({
   model = process.env.SARVAM_MODEL || "sarvam-m",
   endpoint = "https://api.sarvam.ai/v1/chat/completions",
 }) {
+  function resolveMaxTokens(requestedMaxTokens) {
+    const configuredCap = Number(
+      process.env.SARVAM_MAX_TOKENS || SARVAM_STARTER_MAX_TOKENS,
+    );
+    const safeCap =
+      Number.isFinite(configuredCap) && configuredCap > 0
+        ? Math.floor(configuredCap)
+        : SARVAM_STARTER_MAX_TOKENS;
+    const requested = Number(requestedMaxTokens);
+    if (!Number.isFinite(requested) || requested <= 0) return safeCap;
+    return Math.min(Math.floor(requested), safeCap);
+  }
+
   async function sendChatMessages({ messages, optimizedParams, signal }) {
     const systemText = messages
       .filter((message) => message?.role === "system")
@@ -87,7 +102,7 @@ export function createSarvamService({
 
     const payload = {
       model,
-      max_tokens: optimizedParams.maxTokens,
+      max_tokens: resolveMaxTokens(optimizedParams.maxTokens),
       temperature: optimizedParams.temperature,
     };
 
