@@ -172,7 +172,21 @@ export function createHistoryService({ config, supabaseUrl, supabaseAnonKey }) {
       .select("id, title, created_at, updated_at")
       .single();
 
-    if (error) throw error;
+    if (error) {
+      // Parallel writes can race on first message; refetch instead of failing.
+      if (error.code === "23505" && chatId && isUuid(chatId)) {
+        const { data: existing, error: fetchError } = await client
+          .from("chat_sessions")
+          .select("id, title, created_at, updated_at")
+          .eq("id", chatId)
+          .eq("user_id", userId)
+          .maybeSingle();
+
+        if (fetchError) throw fetchError;
+        if (existing) return mapSession(existing);
+      }
+      throw error;
+    }
     return mapSession(data);
   }
 
@@ -251,7 +265,6 @@ export function createHistoryService({ config, supabaseUrl, supabaseAnonKey }) {
     const sanitizedMessage = sanitizeInput(message, maxMessageLength);
     if (!sanitizedMessage || !chatId || chatId === "default") return [];
 
-    await ensureSession(userId, chatId, authToken);
     const client = getAuthedClient(authToken);
     const { data, error } = await client
       .from("chat_messages")
