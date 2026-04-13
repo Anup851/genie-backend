@@ -183,6 +183,39 @@ function getISTString() {
   const get = (type) => parts.find((p) => p.type === type)?.value || "00";
   return `${get("year")}-${get("month")}-${get("day")} ${get("hour")}:${get("minute")} IST`;
 }
+
+async function ensureChatSessionForRoute(userId, chatId, authToken) {
+  if (!userId || !chatId || chatId === "default") return null;
+  return ensureSession(userId, chatId, authToken);
+}
+
+async function persistConversationTurn({
+  userId,
+  authToken,
+  chatId,
+  userMessage,
+  assistantReply,
+}) {
+  const activeChatId = chatId || "default";
+  await ensureChatSessionForRoute(userId, activeChatId, authToken);
+
+  await Promise.all([
+    saveMessage(userId, "user", userMessage, activeChatId, authToken),
+    saveMessage(userId, "assistant", assistantReply, activeChatId, authToken),
+  ]);
+
+  const history = await getChatHistory(userId, activeChatId, authToken);
+  const isFirstMessage = history.length <= 2;
+
+  if (isFirstMessage) {
+    await touchSession(userId, activeChatId, userMessage, authToken);
+  } else {
+    await touchSession(userId, activeChatId, null, authToken);
+  }
+
+  return { history, isFirstMessage };
+}
+
 function buildMediaSystemPrompt(mimeType = "") {
   const mime = String(mimeType || "").toLowerCase();
   const extractionMode =
@@ -477,7 +510,8 @@ app.get("/auth", (req, res) => {
 
 app.get("/api/health", (req, res) => {
   res.json({
-    status: "âœ… Genie Backend (COMPLETE FIXED)",
+    status: "ok",
+    service: "genie-backend",
     timestamp: new Date().toISOString(),
     limits: {
       maxHistory: MAX_HISTORY_LENGTH,
@@ -654,23 +688,13 @@ async function analyzeMediaHandler(req, res) {
 
     const reply = cleanAssistantReply(rawReply || "I could not analyze this file.");
 
-    await saveMessage(
+    await persistConversationTurn({
       userId,
-      "user",
-      `[Media: ${mimeType}] ${userPrompt}`,
-      activeChatId,
       authToken,
-    );
-    await saveMessage(userId, "assistant", reply, activeChatId, authToken);
-
-    const history = await getChatHistory(userId, activeChatId, authToken);
-    const isFirstMessage = history.length <= 2;
-
-    if (isFirstMessage) {
-      await touchSession(userId, activeChatId, userPrompt, authToken);
-    } else {
-      await touchSession(userId, activeChatId, null, authToken);
-    }
+      chatId: activeChatId,
+      userMessage: `[Media: ${mimeType}] ${userPrompt}`,
+      assistantReply: reply,
+    });
 
     return res.json({
       reply,
@@ -726,16 +750,13 @@ app.post("/generate-image", supabaseAuthRequired, async (req, res) => {
     const result = await callDeepAiTextToImage(userPrompt);
     const reply = `Generated image for: "${userPrompt}"\n${result.imageUrl}`;
 
-    await saveMessage(userId, "user", userPrompt, activeChatId, authToken);
-    await saveMessage(userId, "assistant", reply, activeChatId, authToken);
-
-    const history = await getChatHistory(userId, activeChatId, authToken);
-    const isFirstMessage = history.length <= 2;
-    if (isFirstMessage) {
-      await touchSession(userId, activeChatId, userPrompt, authToken);
-    } else {
-      await touchSession(userId, activeChatId, null, authToken);
-    }
+    await persistConversationTurn({
+      userId,
+      authToken,
+      chatId: activeChatId,
+      userMessage: userPrompt,
+      assistantReply: reply,
+    });
 
     return res.json({
       reply,
@@ -773,16 +794,13 @@ app.post("/chat/manual", supabaseAuthRequired, async (req, res) => {
   }
 
   try {
-    await saveMessage(userId, "user", String(message).trim(), activeChatId, authToken);
-    await saveMessage(userId, "assistant", String(reply).trim(), activeChatId, authToken);
-
-    const history = await getChatHistory(userId, activeChatId, authToken);
-    const isFirstMessage = history.length <= 2;
-    if (isFirstMessage) {
-      await touchSession(userId, activeChatId, String(message).trim(), authToken);
-    } else {
-      await touchSession(userId, activeChatId, null, authToken);
-    }
+    await persistConversationTurn({
+      userId,
+      authToken,
+      chatId: activeChatId,
+      userMessage: String(message).trim(),
+      assistantReply: String(reply).trim(),
+    });
 
     return res.json({ ok: true });
   } catch (err) {
