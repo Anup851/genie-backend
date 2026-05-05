@@ -2,3 +2,6 @@ node_modules
 .env
 dist
 build
+.worktrees/
+backend-sync-temp/
+git-editor-noop.cmd

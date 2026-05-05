@@ -1,4 +1,4 @@
-// server.js - Genie Backend (COMPLETE FIXED)
+﻿// server.js - Genie Backend (COMPLETE FIXED)
 import crypto from "crypto";
 import express from "express";
 import fetch from "node-fetch";
@@ -40,6 +40,16 @@ const OPENROUTER_MEDIA_TIMEOUT_MS = Math.max(
   10000,
   Number(process.env.OPENROUTER_MEDIA_TIMEOUT_MS || 60000),
 );
+const PARSEKIT_API_BASE = String(
+  process.env.PARSEKIT_API_BASE || "https://api.parsekit.ai/api/v1",
+).replace(/\/+$/, "");
+const PARSEKIT_ANALYZE_ENDPOINT = String(
+  process.env.PARSEKIT_ANALYZE_ENDPOINT || "/analyze",
+);
+const PARSEKIT_MEDIA_TIMEOUT_MS = Math.max(
+  10000,
+  Number(process.env.PARSEKIT_MEDIA_TIMEOUT_MS || 120000),
+);
 const DEEPAI_API_BASE = "https://api.deepai.org/api";
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL =
@@ -80,8 +90,8 @@ function checkRateLimit(userId) {
 }
 
 // --- Middleware ---
-app.use(express.json({ limit: "20mb" }));
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: process.env.EXPRESS_JSON_LIMIT || "70mb" }));
+app.use(express.urlencoded({ extended: true, limit: process.env.EXPRESS_JSON_LIMIT || "70mb" }));
 app.use(cors());
 app.use(express.static(__dirname));
 
@@ -238,11 +248,49 @@ function isTextLikeMime(mimeType) {
   const mime = String(mimeType || "").toLowerCase();
   return (
     mime.startsWith("text/") ||
+    mime.includes("rtf") ||
     mime.includes("json") ||
     mime.includes("csv") ||
     mime.includes("xml") ||
-    mime.includes("javascript")
+    mime.includes("javascript") ||
+    mime.includes("typescript") ||
+    mime.includes("x-python")
   );
+}
+
+function inferMediaMimeType({ mediaType = "", dataUrlMime = "", mediaName = "" } = {}) {
+  const supplied = String(mediaType || "").toLowerCase();
+  if (supplied && supplied !== "application/octet-stream") return supplied;
+
+  const fromDataUrl = String(dataUrlMime || "").toLowerCase();
+  if (fromDataUrl && fromDataUrl !== "application/octet-stream") return fromDataUrl;
+
+  const name = String(mediaName || "").toLowerCase();
+  const extensionMap = {
+    ".pdf": "application/pdf",
+    ".doc": "application/msword",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".txt": "text/plain",
+    ".md": "text/markdown",
+    ".json": "application/json",
+    ".csv": "text/csv",
+    ".rtf": "application/rtf",
+    ".xml": "application/xml",
+    ".html": "text/html",
+    ".css": "text/css",
+    ".js": "application/javascript",
+    ".ts": "text/typescript",
+    ".py": "text/x-python",
+    ".java": "text/x-java-source",
+    ".c": "text/x-c",
+    ".cpp": "text/x-c++",
+  };
+
+  for (const [extension, mime] of Object.entries(extensionMap)) {
+    if (name.endsWith(extension)) return mime;
+  }
+
+  return supplied || fromDataUrl || "";
 }
 
 function mapRoleForGemini(role) {
@@ -432,6 +480,272 @@ async function callOpenRouterChatCompletion({
   return extractOpenRouterText(data) || "No response.";
 }
 
+function appendIfPresent(lines, label, value) {
+  if (value == null) return;
+  if (Array.isArray(value)) {
+    const items = value
+      .map((item) => {
+        if (typeof item === "string") return item.trim();
+        if (item && typeof item === "object") return JSON.stringify(item);
+        return "";
+      })
+      .filter(Boolean);
+    if (!items.length) return;
+    lines.push(`**${label}**`);
+    lines.push(items.map((item) => `- ${item}`).join("\n"));
+    return;
+  }
+
+  if (typeof value === "object") {
+    const json = JSON.stringify(value, null, 2);
+    if (json && json !== "{}") {
+      lines.push(`**${label}**`);
+      lines.push("```json\n" + json + "\n```");
+    }
+    return;
+  }
+
+  const text = String(value || "").trim();
+  if (!text) return;
+  lines.push(`**${label}**`);
+  lines.push(text);
+}
+
+function getNestedValue(source, path) {
+  return String(path || "")
+    .split(".")
+    .filter(Boolean)
+    .reduce((value, key) => (value == null ? undefined : value[key]), source);
+}
+
+function firstStringAtPaths(source, paths = []) {
+  for (const path of paths) {
+    const value = getNestedValue(source, path);
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "";
+}
+
+function collectParseKitText(source, depth = 0, seen = new Set()) {
+  if (source == null || depth > 5) return [];
+  if (typeof source === "string") {
+    const text = source.trim();
+    return text ? [text] : [];
+  }
+  if (typeof source !== "object") return [];
+  if (seen.has(source)) return [];
+  seen.add(source);
+
+  const preferredKeys = [
+    "answer",
+    "analysis",
+    "summary",
+    "markdown",
+    "text",
+    "content",
+    "result",
+    "data",
+    "output",
+    "document",
+    "extraction",
+    "insights",
+    "keyDetails",
+    "key_details",
+    "redFlags",
+    "red_flags",
+    "questions",
+    "qa",
+  ];
+  const entries = Object.entries(source).sort(([a], [b]) => {
+    const ai = preferredKeys.indexOf(a);
+    const bi = preferredKeys.indexOf(b);
+    return (ai === -1 ? 999 : ai) - (bi === -1 ? 999 : bi);
+  });
+
+  const chunks = [];
+  for (const [, value] of entries) {
+    chunks.push(...collectParseKitText(value, depth + 1, seen));
+  }
+  return chunks;
+}
+
+function formatParseKitAnalysisReply(data, userPrompt = "") {
+  if (typeof data === "string") return data.trim();
+
+  const directText = firstStringAtPaths(data, [
+    "reply",
+    "answer",
+    "analysis",
+    "summary",
+    "content",
+    "text",
+    "markdown",
+    "result.reply",
+    "result.answer",
+    "result.analysis",
+    "result.summary",
+    "result.content",
+    "result.text",
+    "result.markdown",
+    "data.reply",
+    "data.answer",
+    "data.analysis",
+    "data.summary",
+    "data.content",
+    "data.text",
+    "data.markdown",
+    "output.reply",
+    "output.answer",
+    "output.analysis",
+    "output.summary",
+    "output.content",
+    "output.text",
+    "output.markdown",
+    "document.text",
+    "document.markdown",
+  ]);
+
+  const lines = [];
+  if (directText) {
+    lines.push(directText.trim());
+  }
+
+  const result = data?.result && typeof data.result === "object" ? data.result : {};
+  const body = data?.data && typeof data.data === "object" ? data.data : {};
+
+  appendIfPresent(lines, "Key details", data?.key_details || data?.keyDetails || result?.key_details || result?.keyDetails || body?.key_details || body?.keyDetails);
+  appendIfPresent(lines, "Entities", data?.entities || result?.entities || body?.entities);
+  appendIfPresent(lines, "Red flags", data?.red_flags || data?.redFlags || result?.red_flags || result?.redFlags || body?.red_flags || body?.redFlags);
+  appendIfPresent(lines, "Questions and answers", data?.qa || data?.questions || result?.qa || result?.questions || body?.qa || body?.questions);
+
+  if (!lines.length) {
+    const collected = Array.from(new Set(collectParseKitText(data)))
+      .filter((text) => text.length > 2 && !/^true|false|null$/i.test(text))
+      .slice(0, 8);
+    if (collected.length) {
+      lines.push(collected.join("\n\n"));
+    }
+  }
+
+  if (!lines.length) {
+    const json = JSON.stringify(data, null, 2);
+    return json && json !== "{}"
+      ? "ParseKit returned this analysis:\n```json\n" + json + "\n```"
+      : "ParseKit analyzed the file, but returned no readable content.";
+  }
+
+  const prompt = String(userPrompt || "").trim();
+  if (prompt && !/^analy[sz]e this file/i.test(prompt)) {
+    lines.unshift(`Here is the ParseKit analysis for: "${prompt}"`);
+  }
+
+  return lines.join("\n\n").trim();
+}
+
+async function callParseKitAnalyze({
+  mediaData,
+  mediaName = "uploaded-file",
+  mimeType = "application/octet-stream",
+  prompt = "",
+  signal,
+}) {
+  const apiKey = String(process.env.PARSEKIT_API_KEY || "").trim();
+  if (!apiKey) {
+    const err = new Error("Missing PARSEKIT_API_KEY");
+    err.code = "MISSING_PARSEKIT_API_KEY";
+    throw err;
+  }
+
+  if (
+    typeof globalThis.fetch !== "function" ||
+    typeof globalThis.FormData !== "function" ||
+    typeof globalThis.Blob !== "function"
+  ) {
+    const err = new Error("Native fetch/FormData/Blob are required for ParseKit uploads");
+    err.code = "MISSING_NATIVE_MULTIPART";
+    throw err;
+  }
+
+  const dataUrlMatch = String(mediaData || "").match(
+    /^data:([a-zA-Z0-9.+-]+\/[a-zA-Z0-9.+-]+);base64,(.+)$/,
+  );
+  if (!dataUrlMatch) {
+    const err = new Error("Invalid media format");
+    err.status = 400;
+    throw err;
+  }
+
+  const base64Data = dataUrlMatch[2];
+  const buffer = Buffer.from(base64Data, "base64");
+  const form = new globalThis.FormData();
+  form.append("file", new globalThis.Blob([buffer], { type: mimeType }), mediaName);
+
+  const trimmedPrompt = String(prompt || "").trim();
+  if (trimmedPrompt) {
+    form.append("prompt", trimmedPrompt);
+    form.append("question", trimmedPrompt);
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(),
+    PARSEKIT_MEDIA_TIMEOUT_MS,
+  );
+  const abortHandler = () => controller.abort();
+
+  if (signal) {
+    if (signal.aborted) {
+      controller.abort();
+    } else {
+      signal.addEventListener("abort", abortHandler, { once: true });
+    }
+  }
+
+  try {
+    const response = await globalThis.fetch(
+      `${PARSEKIT_API_BASE}${PARSEKIT_ANALYZE_ENDPOINT}`,
+      {
+        method: "POST",
+        headers: {
+          "x-api-key": apiKey,
+        },
+        body: form,
+        signal: controller.signal,
+      },
+    );
+
+    const raw = await response.text();
+    let parsed = null;
+    try {
+      parsed = raw ? JSON.parse(raw) : {};
+    } catch {
+      parsed = raw;
+    }
+
+    if (!response.ok) {
+      const err = new Error(`ParseKit API error: ${response.status}`);
+      err.status = response.status;
+      err.body = typeof parsed === "string" ? parsed : JSON.stringify(parsed);
+      throw err;
+    }
+
+    return parsed;
+  } catch (err) {
+    if (controller.signal.aborted) {
+      const timeoutErr = new Error("ParseKit media request timed out");
+      timeoutErr.code = "PARSEKIT_TIMEOUT";
+      timeoutErr.status = 504;
+      throw timeoutErr;
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+    if (signal) {
+      signal.removeEventListener("abort", abortHandler);
+    }
+  }
+}
+
 async function callDeepAiTextToImage(prompt, signal) {
   const apiKey = String(process.env.DEEPAI_API_KEY || "").trim();
   if (!apiKey) {
@@ -597,14 +911,12 @@ async function analyzeMediaHandler(req, res) {
   const userPrompt = String(prompt || defaultPrompt).trim() || defaultPrompt;
 
   try {
-    const openRouterKey = String(
-      process.env.OPENROUTER_API_KEY || process.env.OPENAI_API_KEY || "",
-    ).trim();
-    const openRouterKeyPreview = openRouterKey
-      ? `${openRouterKey.slice(0, 10)}...${openRouterKey.slice(-4)}`
+    const parseKitKey = String(process.env.PARSEKIT_API_KEY || "").trim();
+    const parseKitKeyPreview = parseKitKey
+      ? `${parseKitKey.slice(0, 10)}...${parseKitKey.slice(-4)}`
       : "MISSING";
     console.log(
-      `[KEY CHECK] route=/analyze-media provider=OPENROUTER key=${openRouterKeyPreview} model=${OPENROUTER_MEDIA_MODEL} chatId=${activeChatId}`,
+      `[KEY CHECK] route=/analyze-media provider=PARSEKIT key=${parseKitKeyPreview} chatId=${activeChatId}`,
     );
 
     const dataUrlMatch = uploadData.match(
@@ -614,79 +926,44 @@ async function analyzeMediaHandler(req, res) {
       return res.status(400).json({ error: "Invalid media format" });
     }
 
-    const mimeType = String(mediaType || dataUrlMatch[1] || "").toLowerCase();
-    const base64Data = dataUrlMatch[2];
     const safeMediaName = String(mediaName || "uploaded-file").slice(0, 160);
-
-    if (!openRouterKey) {
-      return res.status(200).json({
-        reply:
-          "Media analysis is not configured on backend. Add OPENROUTER_API_KEY in server secrets/env and try again.",
-      });
-    }
-
-    const userParts = [{ type: "text", text: userPrompt }];
-    const plugins = [];
-
-    if (mimeType.startsWith("image/")) {
-      userParts.push({
-        type: "image_url",
-        image_url: {
-          url: uploadData,
-        },
-      });
-    } else if (mimeType === "application/pdf") {
-      userParts.push({
-        type: "file",
-        file: {
-          filename: safeMediaName,
-          file_data: uploadData,
-        },
-      });
-      plugins.push({
-        id: "file-parser",
-        pdf: { engine: "pdf-text" },
-      });
-    } else if (isTextLikeMime(mimeType)) {
-      // For text-like uploads, inline text is more reliable than binary upload.
-      let decodedText = "";
-      try {
-        decodedText = Buffer.from(base64Data, "base64").toString("utf8");
-      } catch (err) {
-        decodedText = "";
-      }
-
-      if (!decodedText.trim()) {
-        return res.status(200).json({
-          reply:
-            "This text file could not be decoded. Try uploading UTF-8 text, or convert it to PDF.",
-        });
-      }
-
-      const clipped = decodedText.slice(0, 80000);
-      userParts.push({
-        type: "text",
-        text: `File: ${safeMediaName}\n\n${clipped}`,
-      });
-    } else {
-      return res.status(200).json({
-        reply:
-          "This file type is not supported yet for direct analysis. Please convert it to PDF, TXT, CSV, or image and upload again.",
-      });
-    }
-
-    const mediaMaxTokens = Number(process.env.MEDIA_MAX_TOKENS || 1200);
-    const mediaTemperature = Number(process.env.MEDIA_TEMPERATURE || 0.1);
-    const rawReply = await callOpenRouterChatCompletion({
-      systemInstruction: buildMediaSystemPrompt(mimeType),
-      messages: [{ role: "user", content: userParts }],
-      temperature: mediaTemperature,
-      maxTokens: mediaMaxTokens,
-      model: OPENROUTER_MEDIA_MODEL,
-      plugins,
+    const mimeType = inferMediaMimeType({
+      mediaType,
+      dataUrlMime: dataUrlMatch[1],
+      mediaName: safeMediaName,
     });
 
-    const reply = cleanAssistantReply(rawReply || "I could not analyze this file.");
+    if (!parseKitKey) {
+      return res.status(200).json({
+        reply:
+          "Media analysis is not configured on backend. Add PARSEKIT_API_KEY in server secrets/env and try again.",
+      });
+    }
+
+    const supportedByParseKit =
+      mimeType.startsWith("image/") ||
+      mimeType === "application/pdf" ||
+      mimeType.includes("word") ||
+      mimeType.includes("officedocument.wordprocessingml") ||
+      isTextLikeMime(mimeType);
+
+    if (!supportedByParseKit) {
+      return res.status(200).json({
+        reply:
+          "This file type is not supported yet for ParseKit analysis. Please upload a PDF, DOCX, TXT, CSV, code/text file, or image.",
+      });
+    }
+
+    const parseKitResult = await callParseKitAnalyze({
+      mediaData: uploadData,
+      mediaName: safeMediaName,
+      mimeType,
+      prompt: userPrompt,
+    });
+    const reply = cleanAssistantReply(
+      formatParseKitAnalysisReply(parseKitResult, userPrompt) ||
+        "I could not analyze this file.",
+    );
 
     await persistConversationTurn({
       userId,
@@ -702,23 +979,16 @@ async function analyzeMediaHandler(req, res) {
     });
   } catch (err) {
     console.error("/analyze-media error:", err);
-    if (err?.code === "OPENROUTER_TIMEOUT" || err?.status === 504) {
+    if (err?.code === "PARSEKIT_TIMEOUT" || err?.status === 504) {
       return res.status(200).json({
         reply:
-          "Media analysis timed out on OpenRouter. Try a smaller file, a shorter prompt, or set a faster model.",
-      });
-    }
-    if (err?.status === 404) {
-      return res.status(200).json({
-        reply:
-          `Media analysis model not found: \`${err.model || OPENROUTER_MEDIA_MODEL}\` on OpenRouter. ` +
-          "Set OPENROUTER_MEDIA_MODEL to a valid model and retry.",
+          "Media analysis timed out on ParseKit. Try a smaller file or a shorter prompt.",
       });
     }
     return res.status(500).json({
       reply:
         err?.body && String(err.body).trim()
-          ? `Media analysis failed: ${String(err.body).slice(0, 300)}`
+          ? `ParseKit media analysis failed: ${String(err.body).slice(0, 300)}`
           : "Sorry, an error occurred while analyzing the file.",
     });
   }
@@ -1202,13 +1472,12 @@ app.listen(PORT, () => {
 âœ… Genie Backend (COMPLETE FIXED) Running!
 ðŸ“ Port: ${PORT}
 ðŸ” SARVAM_API_KEY (chat): ${process.env.SARVAM_API_KEY ? "Loaded" : "Missing!"}
-ðŸ” GEMINI_API_KEY (media): ${process.env.GEMINI_API_KEY ? "Loaded" : "Missing!"}
+ðŸ” PARSEKIT_API_KEY (media): ${process.env.PARSEKIT_API_KEY ? "Loaded" : "Missing!"}
 ðŸ” DEEPAI_API_KEY (images): ${process.env.DEEPAI_API_KEY ? "Loaded" : "Missing!"}
 ðŸ§  GEMINI_MODEL: ${GEMINI_MODEL}
-ðŸ§  GEMINI_MEDIA_MODEL: ${GEMINI_MEDIA_MODEL}
-ðŸ§  GEMINI_API_VERSION: ${GEMINI_API_VERSION}
-ðŸ§  MEDIA_MAX_TOKENS: ${Number(process.env.MEDIA_MAX_TOKENS || 4096)}
-ðŸ§  MEDIA_TEMPERATURE: ${Number(process.env.MEDIA_TEMPERATURE || 0.1)}
+ðŸ§  PARSEKIT_API_BASE: ${PARSEKIT_API_BASE}
+ðŸ§  PARSEKIT_ANALYZE_ENDPOINT: ${PARSEKIT_ANALYZE_ENDPOINT}
+ðŸ§  PARSEKIT_MEDIA_TIMEOUT_MS: ${PARSEKIT_MEDIA_TIMEOUT_MS}
 
 ðŸ“ˆ FIXED LIMITS:
   Max History: ${MAX_HISTORY_LENGTH} messages
