@@ -156,11 +156,14 @@ const {
   forceCleanChat,
   getChatHistory,
   getChatStats,
+  listMemories,
   listSessions,
   rollbackLastAssistantReply,
   saveMessage,
   touchSession,
+  upsertMemory,
   updateSessionTitle,
+  deleteMemories,
 } = historyService;
 
 // ============================================================
@@ -199,10 +202,8 @@ async function persistConversationTurn({
   const activeChatId = chatId || "default";
   await ensureChatSessionForRoute(userId, activeChatId, authToken);
 
-  await Promise.all([
-    saveMessage(userId, "user", userMessage, activeChatId, authToken),
-    saveMessage(userId, "assistant", assistantReply, activeChatId, authToken),
-  ]);
+  await saveMessage(userId, "user", userMessage, activeChatId, authToken);
+  await saveMessage(userId, "assistant", assistantReply, activeChatId, authToken);
 
   const history = await getChatHistory(userId, activeChatId, authToken);
   const isFirstMessage = history.length <= 2;
@@ -695,6 +696,48 @@ app.get("/chat/:userId/:chatId", supabaseAuthRequired, async (req, res) => {
 
   const messages = await getChatHistory(userId, chatId, authToken);
   res.json({ chatId, messages });
+});
+
+app.get("/memory/:userId", supabaseAuthRequired, async (req, res) => {
+  const userId = req.auth?.sub;
+  const authToken = req.auth?.token;
+  if (!userId) return res.status(400).json({ error: "Invalid userId" });
+
+  try {
+    const memories = await listMemories(userId, authToken);
+    return res.json({ memories });
+  } catch (err) {
+    console.error("/memory list error:", err);
+    return res.status(500).json({ error: "Failed to load memory" });
+  }
+});
+
+app.post("/memory/:userId", supabaseAuthRequired, async (req, res) => {
+  const userId = req.auth?.sub;
+  const authToken = req.auth?.token;
+  if (!userId) return res.status(400).json({ error: "Invalid userId" });
+
+  try {
+    const memory = await upsertMemory(userId, req.body || {}, authToken);
+    return res.json({ memory });
+  } catch (err) {
+    console.error("/memory upsert error:", err);
+    return res.status(500).json({ error: "Failed to save memory" });
+  }
+});
+
+app.delete("/memory/:userId", supabaseAuthRequired, async (req, res) => {
+  const userId = req.auth?.sub;
+  const authToken = req.auth?.token;
+  if (!userId) return res.status(400).json({ error: "Invalid userId" });
+
+  try {
+    await deleteMemories(userId, authToken);
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("/memory delete error:", err);
+    return res.status(500).json({ error: "Failed to clear memory" });
+  }
 });
 
 async function analyzeMediaHandler(req, res) {

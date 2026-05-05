@@ -30,6 +30,19 @@ function mapMessage(row) {
   };
 }
 
+function mapMemory(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    category: row.category || "general",
+    key: row.memory_key,
+    label: row.category || row.memory_key,
+    value: row.value,
+    createdAt: row.created_at ? new Date(row.created_at).getTime() : Date.now(),
+    updatedAt: row.updated_at ? new Date(row.updated_at).getTime() : Date.now(),
+  };
+}
+
 function toTitleCase(text = "") {
   return String(text || "")
     .split(/\s+/)
@@ -308,6 +321,7 @@ export function createHistoryService({ config, supabaseUrl, supabaseAnonKey }) {
         .eq("user_id", userId)
         .eq("session_id", chatId)
         .order("created_at", { ascending: true })
+        .order("id", { ascending: true })
         .limit(overflowCount);
 
       if (overflowError) {
@@ -359,7 +373,8 @@ export function createHistoryService({ config, supabaseUrl, supabaseAnonKey }) {
         .select("id, role, message, created_at")
         .eq("user_id", userId)
         .eq("session_id", chatId)
-        .order("created_at", { ascending: true });
+        .order("created_at", { ascending: true })
+        .order("id", { ascending: true });
 
       if (error) throw error;
       return Array.isArray(data)
@@ -486,6 +501,63 @@ export function createHistoryService({ config, supabaseUrl, supabaseAnonKey }) {
     };
   }
 
+  async function listMemories(userId, authToken) {
+    const client = getAuthedClient(authToken);
+    const { data, error } = await client
+      .from("user_memory")
+      .select("id, category, memory_key, value, created_at, updated_at")
+      .eq("user_id", userId)
+      .order("updated_at", { ascending: false });
+
+    if (error) throw error;
+    return Array.isArray(data) ? data.map(mapMemory).filter(Boolean) : [];
+  }
+
+  async function upsertMemory(userId, memory, authToken) {
+    const category = String(memory?.category || memory?.label || "general")
+      .trim()
+      .slice(0, 80) || "general";
+    const memoryKey = String(memory?.key || memory?.memory_key || "")
+      .trim()
+      .toLowerCase()
+      .slice(0, 120);
+    const value = String(memory?.value || "").trim().slice(0, 2000);
+
+    if (!memoryKey || !value) {
+      throw new Error("Invalid memory");
+    }
+
+    const client = getAuthedClient(authToken);
+    const { data, error } = await client
+      .from("user_memory")
+      .upsert(
+        {
+          user_id: userId,
+          category,
+          memory_key: memoryKey,
+          value,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "user_id,category,memory_key" },
+      )
+      .select("id, category, memory_key, value, created_at, updated_at")
+      .single();
+
+    if (error) throw error;
+    return mapMemory(data);
+  }
+
+  async function deleteMemories(userId, authToken) {
+    const client = getAuthedClient(authToken);
+    const { error } = await client
+      .from("user_memory")
+      .delete()
+      .eq("user_id", userId);
+
+    if (error) throw error;
+    return { ok: true };
+  }
+
   return {
     createSession,
     deleteAllSessions,
@@ -494,10 +566,13 @@ export function createHistoryService({ config, supabaseUrl, supabaseAnonKey }) {
     forceCleanChat,
     getChatHistory,
     getChatStats,
+    listMemories,
     listSessions,
     rollbackLastAssistantReply,
     saveMessage,
     touchSession,
+    upsertMemory,
     updateSessionTitle,
+    deleteMemories,
   };
 }

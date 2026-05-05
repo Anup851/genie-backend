@@ -327,10 +327,8 @@ export function createChatService({
       await historyService.ensureSession(userId, chatId, authToken);
     }
 
-    await Promise.all([
-      saveMessage(userId, "user", sanitizedMessage, chatId, authToken),
-      saveMessage(userId, "assistant", reply, chatId, authToken),
-    ]);
+    await saveMessage(userId, "user", sanitizedMessage, chatId, authToken);
+    await saveMessage(userId, "assistant", reply, chatId, authToken);
 
     if (isFirstMessage) {
       await touchSession(userId, chatId, sanitizedMessage, authToken);
