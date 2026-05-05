@@ -41,10 +41,15 @@ const OPENROUTER_MEDIA_TIMEOUT_MS = Math.max(
   Number(process.env.OPENROUTER_MEDIA_TIMEOUT_MS || 60000),
 );
 const PARSEKIT_API_BASE = String(
-  process.env.PARSEKIT_API_BASE || "https://api.parsekit.ai/api/v1",
+  process.env.PARSEKIT_API_BASE || "https://api.parsekit.dev",
 ).replace(/\/+$/, "");
-const PARSEKIT_ANALYZE_ENDPOINT = String(
-  process.env.PARSEKIT_ANALYZE_ENDPOINT || "/analyze",
+const PARSEKIT_UPLOAD_ENDPOINT = process.env.PARSEKIT_UPLOAD_ENDPOINT || "/upload";
+const PARSEKIT_EXTRACT_ENDPOINT = process.env.PARSEKIT_EXTRACT_ENDPOINT || "/extract";
+const PARSEKIT_JOB_ENDPOINT = process.env.PARSEKIT_JOB_ENDPOINT || "/job";
+const PARSEKIT_EXTRACT_FORMAT = process.env.PARSEKIT_EXTRACT_FORMAT || "structured";
+const PARSEKIT_POLL_INTERVAL_MS = Math.max(
+  500,
+  Number(process.env.PARSEKIT_POLL_INTERVAL_MS || 1200),
 );
 const PARSEKIT_MEDIA_TIMEOUT_MS = Math.max(
   10000,
@@ -642,6 +647,79 @@ function formatParseKitAnalysisReply(data, userPrompt = "") {
   return lines.join("\n\n").trim();
 }
 
+function sleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      const err = new Error("Request aborted");
+      err.name = "AbortError";
+      reject(err);
+      return;
+    }
+
+    const timer = setTimeout(resolve, ms);
+    const abortHandler = () => {
+      clearTimeout(timer);
+      const err = new Error("Request aborted");
+      err.name = "AbortError";
+      reject(err);
+    };
+    signal?.addEventListener("abort", abortHandler, { once: true });
+  });
+}
+
+async function parseKitFetch(pathOrUrl, options = {}) {
+  const url = /^https?:\/\//i.test(String(pathOrUrl))
+    ? String(pathOrUrl)
+    : `${PARSEKIT_API_BASE}${pathOrUrl}`;
+  const response = await globalThis.fetch(url, options);
+  const raw = await response.text();
+  let parsed = null;
+  try {
+    parsed = raw ? JSON.parse(raw) : {};
+  } catch {
+    parsed = raw;
+  }
+
+  if (!response.ok) {
+    const err = new Error(`ParseKit API error: ${response.status}`);
+    err.status = response.status;
+    err.body = typeof parsed === "string" ? parsed : JSON.stringify(parsed);
+    throw err;
+  }
+
+  return parsed;
+}
+
+async function resolveParseKitOutput(result, authHeaders, signal) {
+  let current = result;
+  const startedAt = Date.now();
+
+  while (
+    current?.job_id &&
+    ["queued", "processing", "pending", "running"].includes(
+      String(current?.status || "").toLowerCase(),
+    ) &&
+    Date.now() - startedAt < PARSEKIT_MEDIA_TIMEOUT_MS
+  ) {
+    await sleep(PARSEKIT_POLL_INTERVAL_MS, signal);
+    current = await parseKitFetch(
+      `${PARSEKIT_JOB_ENDPOINT}/${encodeURIComponent(current.job_id)}`,
+      { headers: authHeaders, signal },
+    );
+  }
+
+  if (current?.output_url) {
+    try {
+      const output = await parseKitFetch(current.output_url, { signal });
+      return { ...current, output };
+    } catch {
+      return current;
+    }
+  }
+
+  return current;
+}
+
 async function callParseKitAnalyze({
   mediaData,
   mediaName = "uploaded-file",
@@ -680,12 +758,6 @@ async function callParseKitAnalyze({
   const form = new globalThis.FormData();
   form.append("file", new globalThis.Blob([buffer], { type: mimeType }), mediaName);
 
-  const trimmedPrompt = String(prompt || "").trim();
-  if (trimmedPrompt) {
-    form.append("prompt", trimmedPrompt);
-    form.append("question", trimmedPrompt);
-  }
-
   const controller = new AbortController();
   const timeout = setTimeout(
     () => controller.abort(),
@@ -702,40 +774,54 @@ async function callParseKitAnalyze({
   }
 
   try {
-    const response = await globalThis.fetch(
-      `${PARSEKIT_API_BASE}${PARSEKIT_ANALYZE_ENDPOINT}`,
-      {
-        method: "POST",
-        headers: {
-          "x-api-key": apiKey,
-        },
-        body: form,
-        signal: controller.signal,
+    const authHeaders = { Authorization: `Bearer ${apiKey}` };
+    const uploadResult = await parseKitFetch(PARSEKIT_UPLOAD_ENDPOINT, {
+      method: "POST",
+      headers: authHeaders,
+      body: form,
+      signal: controller.signal,
+    });
+
+    const fileId = uploadResult?.file_id || uploadResult?.fileId || uploadResult?.id;
+    const fileUrl = uploadResult?.file_url || uploadResult?.fileUrl || uploadResult?.url;
+
+    if (!fileId && !fileUrl) {
+      return uploadResult;
+    }
+
+    const extractBody = {
+      format: PARSEKIT_EXTRACT_FORMAT,
+      ...(fileId ? { file_id: fileId } : { file_url: fileUrl }),
+    };
+    const trimmedPrompt = String(prompt || "").trim();
+    if (trimmedPrompt) {
+      extractBody.instructions = trimmedPrompt;
+      extractBody.question = trimmedPrompt;
+    }
+
+    const extractResult = await parseKitFetch(PARSEKIT_EXTRACT_ENDPOINT, {
+      method: "POST",
+      headers: {
+        ...authHeaders,
+        "Content-Type": "application/json",
       },
-    );
+      body: JSON.stringify(extractBody),
+      signal: controller.signal,
+    });
 
-    const raw = await response.text();
-    let parsed = null;
-    try {
-      parsed = raw ? JSON.parse(raw) : {};
-    } catch {
-      parsed = raw;
-    }
-
-    if (!response.ok) {
-      const err = new Error(`ParseKit API error: ${response.status}`);
-      err.status = response.status;
-      err.body = typeof parsed === "string" ? parsed : JSON.stringify(parsed);
-      throw err;
-    }
-
-    return parsed;
+    return resolveParseKitOutput(extractResult, authHeaders, controller.signal);
   } catch (err) {
     if (controller.signal.aborted) {
       const timeoutErr = new Error("ParseKit media request timed out");
       timeoutErr.code = "PARSEKIT_TIMEOUT";
       timeoutErr.status = 504;
       throw timeoutErr;
+    }
+    if (err?.cause?.code === "ENOTFOUND" || err?.code === "ENOTFOUND") {
+      const dnsErr = new Error(`ParseKit API host could not be resolved: ${PARSEKIT_API_BASE}`);
+      dnsErr.code = "PARSEKIT_DNS_ERROR";
+      dnsErr.status = 502;
+      throw dnsErr;
     }
     throw err;
   } finally {
@@ -815,11 +901,15 @@ async function supabaseAuthRequired(req, res, next) {
 // ============================================================
 
 app.get("/", (req, res) => {
-  res.sendFile(path.join(__dirname, "index.html"));
+  res.json({
+    status: "ok",
+    service: "genie-backend",
+    message: "Backend API is running. Use the frontend app for chat UI.",
+  });
 });
 
 app.get("/auth", (req, res) => {
-  res.sendFile(path.join(__dirname, "auth.html"));
+  res.redirect("/");
 });
 
 app.get("/api/health", (req, res) => {
@@ -983,6 +1073,12 @@ async function analyzeMediaHandler(req, res) {
       return res.status(200).json({
         reply:
           "Media analysis timed out on ParseKit. Try a smaller file or a shorter prompt.",
+      });
+    }
+    if (err?.code === "PARSEKIT_DNS_ERROR") {
+      return res.status(200).json({
+        reply:
+          "ParseKit media analysis could not reach the API host. The backend is now configured for api.parsekit.dev; redeploy and try again.",
       });
     }
     return res.status(500).json({
@@ -1476,7 +1572,8 @@ app.listen(PORT, () => {
 ðŸ” DEEPAI_API_KEY (images): ${process.env.DEEPAI_API_KEY ? "Loaded" : "Missing!"}
 ðŸ§  GEMINI_MODEL: ${GEMINI_MODEL}
 ðŸ§  PARSEKIT_API_BASE: ${PARSEKIT_API_BASE}
-ðŸ§  PARSEKIT_ANALYZE_ENDPOINT: ${PARSEKIT_ANALYZE_ENDPOINT}
+ðŸ§  PARSEKIT_UPLOAD_ENDPOINT: ${PARSEKIT_UPLOAD_ENDPOINT}
+ðŸ§  PARSEKIT_EXTRACT_ENDPOINT: ${PARSEKIT_EXTRACT_ENDPOINT}
 ðŸ§  PARSEKIT_MEDIA_TIMEOUT_MS: ${PARSEKIT_MEDIA_TIMEOUT_MS}
 
 ðŸ“ˆ FIXED LIMITS:
