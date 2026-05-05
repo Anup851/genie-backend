@@ -750,6 +750,20 @@ async function authorizeParseKit(apiKey, signal) {
       throw err;
     } catch (err) {
       lastError = err;
+      const body = String(err?.body || "");
+      if (
+        body.includes("Tenant or user not found") ||
+        body.includes("apiKey.findUnique") ||
+        body.includes("Invalid or expired bearer token")
+      ) {
+        const keyErr = new Error(
+          "ParseKit API key was not accepted by the configured ParseKit API",
+        );
+        keyErr.code = "PARSEKIT_INVALID_API_KEY";
+        keyErr.status = 401;
+        keyErr.body = body;
+        throw keyErr;
+      }
       if (![400, 401, 403, 404, 415].includes(Number(err?.status))) {
         throw err;
       }
@@ -1149,6 +1163,12 @@ async function analyzeMediaHandler(req, res) {
       return res.status(200).json({
         reply:
           "ParseKit media analysis could not reach the API host. The backend is now configured for api.parsekit.dev; redeploy and try again.",
+      });
+    }
+    if (err?.code === "PARSEKIT_INVALID_API_KEY") {
+      return res.status(200).json({
+        reply:
+          "ParseKit rejected the API key. Get a fresh key from the same ParseKit dashboard used for api.parsekit.dev, update PARSEKIT_API_KEY on Render, then redeploy. Keys from a different ParseKit product/account will not work with this API.",
       });
     }
     return res.status(500).json({
