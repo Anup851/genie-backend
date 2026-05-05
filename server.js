@@ -43,6 +43,8 @@ const OPENROUTER_MEDIA_TIMEOUT_MS = Math.max(
 const PARSEKIT_API_BASE = String(
   process.env.PARSEKIT_API_BASE || "https://api.parsekit.dev",
 ).replace(/\/+$/, "");
+const PARSEKIT_AUTHORIZE_ENDPOINT =
+  process.env.PARSEKIT_AUTHORIZE_ENDPOINT || "/authorize";
 const PARSEKIT_UPLOAD_ENDPOINT = process.env.PARSEKIT_UPLOAD_ENDPOINT || "/upload";
 const PARSEKIT_EXTRACT_ENDPOINT = process.env.PARSEKIT_EXTRACT_ENDPOINT || "/extract";
 const PARSEKIT_JOB_ENDPOINT = process.env.PARSEKIT_JOB_ENDPOINT || "/job";
@@ -690,6 +692,73 @@ async function parseKitFetch(pathOrUrl, options = {}) {
   return parsed;
 }
 
+function extractParseKitBearerToken(data) {
+  const token = [
+    data?.token,
+    data?.access_token,
+    data?.accessToken,
+    data?.bearer_token,
+    data?.bearerToken,
+    data?.data?.token,
+    data?.data?.access_token,
+    data?.data?.accessToken,
+  ].find((value) => typeof value === "string" && value.trim());
+
+  if (!token) return "";
+  return token.replace(/^Bearer\s+/i, "").trim();
+}
+
+async function authorizeParseKit(apiKey, signal) {
+  const attempts = [
+    {
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+      },
+      body: JSON.stringify({ api_key: apiKey, apiKey }),
+    },
+    {
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ api_key: apiKey, apiKey }),
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({}),
+    },
+  ];
+
+  let lastError = null;
+  for (const attempt of attempts) {
+    try {
+      const result = await parseKitFetch(PARSEKIT_AUTHORIZE_ENDPOINT, {
+        method: "POST",
+        headers: attempt.headers,
+        body: attempt.body,
+        signal,
+      });
+      const token = extractParseKitBearerToken(result);
+      if (token) return token;
+
+      const err = new Error("ParseKit authorize returned no bearer token");
+      err.status = 502;
+      err.body = JSON.stringify(result);
+      throw err;
+    } catch (err) {
+      lastError = err;
+      if (![400, 401, 403, 404, 415].includes(Number(err?.status))) {
+        throw err;
+      }
+    }
+  }
+
+  throw lastError || new Error("ParseKit authorization failed");
+}
+
 async function resolveParseKitOutput(result, authHeaders, signal) {
   let current = result;
   const startedAt = Date.now();
@@ -774,7 +843,8 @@ async function callParseKitAnalyze({
   }
 
   try {
-    const authHeaders = { Authorization: `Bearer ${apiKey}` };
+    const bearerToken = await authorizeParseKit(apiKey, controller.signal);
+    const authHeaders = { Authorization: `Bearer ${bearerToken}` };
     const uploadResult = await parseKitFetch(PARSEKIT_UPLOAD_ENDPOINT, {
       method: "POST",
       headers: authHeaders,
@@ -1572,6 +1642,7 @@ app.listen(PORT, () => {
 ðŸ” DEEPAI_API_KEY (images): ${process.env.DEEPAI_API_KEY ? "Loaded" : "Missing!"}
 ðŸ§  GEMINI_MODEL: ${GEMINI_MODEL}
 ðŸ§  PARSEKIT_API_BASE: ${PARSEKIT_API_BASE}
+ðŸ§  PARSEKIT_AUTHORIZE_ENDPOINT: ${PARSEKIT_AUTHORIZE_ENDPOINT}
 ðŸ§  PARSEKIT_UPLOAD_ENDPOINT: ${PARSEKIT_UPLOAD_ENDPOINT}
 ðŸ§  PARSEKIT_EXTRACT_ENDPOINT: ${PARSEKIT_EXTRACT_ENDPOINT}
 ðŸ§  PARSEKIT_MEDIA_TIMEOUT_MS: ${PARSEKIT_MEDIA_TIMEOUT_MS}
