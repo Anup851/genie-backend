@@ -1,10 +1,16 @@
+function needsFullSessionContext(message = "") {
+  const normalized = String(message || "").toLowerCase();
+  return /\b(all previous|entire conversation|whole session|full history|conversation history|what did we discuss|summarize our chat|from the beginning|earlier|previous messages|history of this chat|session summary|compare earlier|all chats)\b/i.test(normalized);
+}
+
 export function buildChatParams(message, maxResponseTokens = 4000, options = {}) {
   const isCodeHeavy = options.forceCodeMode || isCodeHeavyMessage(message);
+  const wantsFullContext = needsFullSessionContext(message);
   return {
     isCodeHeavy,
     maxTokens: isCodeHeavy ? Math.min(maxResponseTokens, 2200) : 900,
     timeout: isCodeHeavy ? 45000 : 20000,
-    historyLimit: isCodeHeavy ? 5 : 6,
+    historyLimit: isCodeHeavy ? 8 : wantsFullContext ? 40 : 2,
     temperature: isCodeHeavy ? 0.22 : 0.45,
   };
 }
