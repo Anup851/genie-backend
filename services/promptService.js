@@ -1,14 +1,11 @@
-import { AIMessage, HumanMessage } from "@langchain/core/messages";
-import { ChatPromptTemplate, MessagesPlaceholder } from "@langchain/core/prompts";
-
 export function buildChatParams(message, maxResponseTokens = 4000, options = {}) {
   const isCodeHeavy = options.forceCodeMode || isCodeHeavyMessage(message);
   return {
     isCodeHeavy,
-    maxTokens: isCodeHeavy ? Math.min(maxResponseTokens, 2800) : 1200,
-    timeout: isCodeHeavy ? 55000 : 30000,
-    historyLimit: isCodeHeavy ? 8 : 12,
-    temperature: isCodeHeavy ? 0.25 : 0.55,
+    maxTokens: isCodeHeavy ? Math.min(maxResponseTokens, 2200) : 900,
+    timeout: isCodeHeavy ? 45000 : 20000,
+    historyLimit: isCodeHeavy ? 5 : 6,
+    temperature: isCodeHeavy ? 0.22 : 0.45,
   };
 }
 
@@ -21,7 +18,7 @@ export async function buildStructuredChatPrompt({
 }) {
   const recentHistory = history
     .slice(-optimizedParams.historyLimit)
-    .map(toLangChainMessage)
+    .map(toHistoryMessage)
     .filter(Boolean);
 
   const systemText = buildSystemInstruction({
@@ -31,28 +28,13 @@ export async function buildStructuredChatPrompt({
 
   const userText = buildUserPrompt(userMessage, newsContextBlock);
 
-  // LangChain stays in the orchestration layer for prompt/history preparation,
-  // while the final Sarvam call still receives plain provider-native messages.
-  const prompt = ChatPromptTemplate.fromMessages([
-    ["system", "{systemInstruction}"],
-    new MessagesPlaceholder("recentChat"),
-    ["human", "{userQuestion}"],
-  ]);
-
-  const langChainMessages = await prompt.formatMessages({
-    systemInstruction: systemText,
-    recentChat: recentHistory,
-    userQuestion: userText,
-  });
-
   return {
     systemText,
     userText,
     historyMessages: recentHistory.map((message) => ({
-      role: message instanceof AIMessage ? "assistant" : "user",
+      role: message.role === "assistant" ? "assistant" : "user",
       content: getMessageContent(message.content),
     })),
-    langChainMessages,
   };
 }
 
@@ -87,13 +69,14 @@ function buildUserPrompt(userMessage, newsContextBlock) {
   return `${newsContextBlock}\n\nUSER_MESSAGE:\n${String(userMessage || "").trim()}`;
 }
 
-function toLangChainMessage(message) {
+function toHistoryMessage(message) {
   if (!message?.role || !message?.message) return null;
-  const content = String(message.message).trim();
+  const content = getMessageContent(message.message);
   if (!content) return null;
-  if (message.role === "assistant") return new AIMessage(content);
-  if (message.role === "user") return new HumanMessage(content);
-  return null;
+  return {
+    role: message.role === "assistant" ? "assistant" : "user",
+    content,
+  };
 }
 
 function getMessageContent(content) {
