@@ -172,12 +172,27 @@ export function createHistoryService({ config, supabaseUrl, supabaseAnonKey }) {
 
   async function createSession(userId, title = "New chat", authToken, chatId = null) {
     const client = getAuthedClient(authToken);
+    const sessionTitle =
+      String(title || "New chat").trim().slice(0, 120) || "New chat";
     const payload = {
       user_id: userId,
-      title: String(title || "New chat").trim().slice(0, 120) || "New chat",
+      title: sessionTitle,
     };
 
     if (chatId && isUuid(chatId)) payload.id = chatId;
+
+    async function fetchExistingSession() {
+      if (!chatId || !isUuid(chatId)) return null;
+      const { data: existing, error: fetchError } = await client
+        .from("chat_sessions")
+        .select("id, title, created_at, updated_at")
+        .eq("id", chatId)
+        .eq("user_id", userId)
+        .maybeSingle();
+
+      if (fetchError) throw fetchError;
+      return existing ? mapSession(existing) : null;
+    }
 
     const { data, error } = await client
       .from("chat_sessions")
@@ -188,15 +203,8 @@ export function createHistoryService({ config, supabaseUrl, supabaseAnonKey }) {
     if (error) {
       // Parallel writes can race on first message; refetch instead of failing.
       if (error.code === "23505" && chatId && isUuid(chatId)) {
-        const { data: existing, error: fetchError } = await client
-          .from("chat_sessions")
-          .select("id, title, created_at, updated_at")
-          .eq("id", chatId)
-          .eq("user_id", userId)
-          .maybeSingle();
-
-        if (fetchError) throw fetchError;
-        if (existing) return mapSession(existing);
+        const existingSession = await fetchExistingSession();
+        if (existingSession) return existingSession;
       }
       throw error;
     }
@@ -219,7 +227,23 @@ export function createHistoryService({ config, supabaseUrl, supabaseAnonKey }) {
 
     if (error) throw error;
     if (data) return mapSession(data);
-    return createSession(userId, "New chat", authToken, chatId);
+
+    try {
+      return await createSession(userId, "New chat", authToken, chatId);
+    } catch (err) {
+      if (err?.code !== "23505") throw err;
+
+      const { data: existing, error: fetchError } = await client
+        .from("chat_sessions")
+        .select("id, title, created_at, updated_at")
+        .eq("id", chatId)
+        .eq("user_id", userId)
+        .maybeSingle();
+
+      if (fetchError) throw fetchError;
+      if (existing) return mapSession(existing);
+      throw err;
+    }
   }
 
   async function touchSession(userId, chatId, titleIfEmpty, authToken) {
