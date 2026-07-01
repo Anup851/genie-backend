@@ -323,18 +323,24 @@ export function createChatService({
 
     const reply = cleanAssistantReply(rawReply);
 
-    if (chatId && chatId !== "default") {
-      await historyService.ensureSession(userId, chatId, authToken);
-    }
+    void (async () => {
+      try {
+        if (chatId && chatId !== "default") {
+          await historyService.ensureSession(userId, chatId, authToken);
+        }
 
-    await saveMessage(userId, "user", sanitizedMessage, chatId, authToken);
-    await saveMessage(userId, "assistant", reply, chatId, authToken);
+        await saveMessage(userId, "user", sanitizedMessage, chatId, authToken);
+        await saveMessage(userId, "assistant", reply, chatId, authToken);
 
-    if (isFirstMessage) {
-      await touchSession(userId, chatId, sanitizedMessage, authToken);
-    } else {
-      await touchSession(userId, chatId, null, authToken);
-    }
+        if (isFirstMessage) {
+          await touchSession(userId, chatId, sanitizedMessage, authToken);
+        } else {
+          await touchSession(userId, chatId, null, authToken);
+        }
+      } catch (error) {
+        console.warn("[CHAT] background persistence warning:", error);
+      }
+    })();
 
     let finalReply = reply;
     let warning = null;
