@@ -1,6 +1,7 @@
 import fetch from "node-fetch";
 
 const SARVAM_STARTER_MAX_TOKENS = 2048;
+const DEFAULT_SARVAM_MODEL = "sarvam-30b";
 
 function getMessageText(content) {
   if (typeof content === "string") return content.trim();
@@ -15,6 +16,16 @@ function getMessageText(content) {
       .trim();
   }
   return "";
+}
+
+function resolveSarvamModel(requestedModel) {
+  const normalized = String(
+    requestedModel || process.env.SARVAM_MODEL || DEFAULT_SARVAM_MODEL,
+  )
+    .trim()
+    .replace(/^models\//i, "");
+
+  return normalized === "sarvam-m" ? DEFAULT_SARVAM_MODEL : normalized;
 }
 
 function isSarvamTurnOrderError(errorText = "") {
@@ -72,7 +83,7 @@ function normalizeSarvamMessages(messages = [], opts = {}) {
 
 export function createSarvamService({
   apiKey,
-  model = process.env.SARVAM_MODEL || "sarvam-m",
+  model = process.env.SARVAM_MODEL || DEFAULT_SARVAM_MODEL,
   endpoint = "https://api.sarvam.ai/v1/chat/completions",
 }) {
   function resolveMaxTokens(requestedMaxTokens) {
@@ -101,7 +112,7 @@ export function createSarvamService({
     };
 
     const payload = {
-      model,
+      model: resolveSarvamModel(model),
       max_tokens: resolveMaxTokens(optimizedParams.maxTokens),
       temperature: optimizedParams.temperature,
     };
