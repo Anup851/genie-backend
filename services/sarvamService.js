@@ -83,7 +83,7 @@ function normalizeSarvamMessages(messages = [], opts = {}) {
 
 export function createSarvamService({
   apiKey,
-  model = process.env.SARVAM_MODEL || DEFAULT_SARVAM_MODEL,
+  model = DEFAULT_SARVAM_MODEL,
   endpoint = "https://api.sarvam.ai/v1/chat/completions",
 }) {
   function resolveMaxTokens(requestedMaxTokens) {
@@ -123,7 +123,7 @@ export function createSarvamService({
       body: JSON.stringify({
         ...payload,
         messages: normalizeSarvamMessages(messages, {
-          includeSystem: true,
+          includeSystem: false,
           systemText,
         }),
       }),
