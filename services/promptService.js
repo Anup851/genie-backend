@@ -5,10 +5,10 @@ export function buildChatParams(message, maxResponseTokens = 4000, options = {})
   const isCodeHeavy = options.forceCodeMode || isCodeHeavyMessage(message);
   return {
     isCodeHeavy,
-    maxTokens: isCodeHeavy ? maxResponseTokens : 1600,
-    timeout: isCodeHeavy ? 75000 : 40000,
+    maxTokens: isCodeHeavy ? Math.min(maxResponseTokens, 2800) : 1200,
+    timeout: isCodeHeavy ? 55000 : 30000,
     historyLimit: isCodeHeavy ? 8 : 12,
-    temperature: isCodeHeavy ? 0.25 : 0.6,
+    temperature: isCodeHeavy ? 0.25 : 0.55,
   };
 }
 
