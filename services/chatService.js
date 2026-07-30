@@ -255,7 +255,7 @@ function buildSessionWarning(historyLength, sessionLimitWarning) {
 
 export function createChatService({
   historyService,
-  longcatService,
+  sarvamService,
   config,
 }) {
   const { maxResponseTokens, sessionLimitWarning } = config;
@@ -315,7 +315,7 @@ export function createChatService({
       { role: "user", content: promptContext.userText },
     ];
 
-    const { reply: rawReply, usage } = await longcatService.sendChatMessages({
+    const { reply: rawReply, usage } = await sarvamService.sendChatMessages({
       messages,
       optimizedParams,
       signal,
@@ -358,7 +358,7 @@ export function createChatService({
       sessionWarning: warning ? sessionWarning.payload : null,
       sessionLimitExceeded: false,
       orchestration: "langchain-history-only",
-      provider: "longcat",
+      provider: "sarvam",
     };
   }
 

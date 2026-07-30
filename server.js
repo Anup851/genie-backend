@@ -10,7 +10,7 @@ import { createClient } from "@supabase/supabase-js";
 import { createChatService, fetchGdeltArticles } from "./services/chatService.js";
 import { createKeyValueStore } from "./services/dataStore.js";
 import { createHistoryService } from "./services/historyService.js";
-import { createLongCatService } from "./services/longcatService.js";
+import { createSarvamService } from "./services/sarvamService.js";
 import { cleanAssistantReply } from "./utils/messageFormatter.js";
 
 dotenv.config({ quiet: true });
@@ -51,10 +51,10 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
 });
 
-const hasLongCatApiKey = !!String(process.env.LONGCAT_API_KEY || "").trim();
-if (!hasLongCatApiKey) {
+const hasSarvamApiKey = !!String(process.env.SARVAM_API_KEY || "").trim();
+if (!hasSarvamApiKey) {
   console.warn(
-    "[BOOT] LONGCAT_API_KEY is missing. Normal /chat will be unavailable, but media analysis can still run.",
+    "[BOOT] SARVAM_API_KEY is missing. Normal /chat will be unavailable, but media analysis can still run.",
   );
 }
 
@@ -122,14 +122,14 @@ const historyService = createHistoryService({
   supabaseAnonKey: SUPABASE_ANON_KEY,
 });
 
-const longcatService = hasLongCatApiKey
-  ? createLongCatService({
-      apiKey: process.env.LONGCAT_API_KEY,
+const sarvamService = hasSarvamApiKey
+  ? createSarvamService({
+      apiKey: process.env.SARVAM_API_KEY,
     })
   : {
       async sendChatMessages() {
-        const err = new Error("LONGCAT_API_KEY is missing");
-        err.code = "LONGCAT_NOT_CONFIGURED";
+        const err = new Error("SARVAM_API_KEY is missing");
+        err.code = "SARVAM_NOT_CONFIGURED";
         err.status = 503;
         throw err;
       },
@@ -137,16 +137,16 @@ const longcatService = hasLongCatApiKey
 
 const chatService = createChatService({
   historyService,
-  longcatService,
+  sarvamService,
   config: {
     maxResponseTokens: MAX_RESPONSE_TOKENS,
     sessionLimitWarning: SESSION_LIMIT_WARNING,
   },
 });
 
-console.log("[BOOT] Modular services ready: historyService, longcatService, chatService");
+console.log("[BOOT] Modular services ready: historyService, sarvamService, chatService");
 console.log("[BOOT] LangChain orchestration is enabled for normal /chat requests");
-console.log("[BOOT] LongCat remains the final model provider for normal chat");
+console.log("[BOOT] Sarvam remains the final model provider for normal chat");
 
 const {
   createSession,
@@ -1005,14 +1005,14 @@ app.post("/chat", supabaseAuthRequired, async (req, res) => {
   }
 
   try {
-    console.log(`[KEY CHECK] route=/chat provider=LONGCAT chatId=${activeChatId}`);
+    console.log(`[KEY CHECK] route=/chat provider=SARVAM chatId=${activeChatId}`);
 
     console.log(
       `ðŸ’¬ Chat request: ${userId.slice(0, 8)}... | ${String(message).trim().length} chars | chatId: ${activeChatId}`,
     );
-    console.log("[CHAT FLOW] Starting LangChain prompt orchestration -> LongCat response flow");
+    console.log("[CHAT FLOW] Starting LangChain prompt orchestration -> Sarvam response flow");
 
-    // âœ… CALL LONGCAT AI
+    // âœ… CALL SARVAM AI
     const controller = new AbortController();
     req.on("close", () => {
       try {
@@ -1033,7 +1033,7 @@ app.post("/chat", supabaseAuthRequired, async (req, res) => {
 
     clearTimeout(timeout);
     console.log(
-      `[CHAT FLOW] Completed LangChain -> LongCat flow | replyLength=${String(chatResult?.reply || "").length} | chatId=${activeChatId}`,
+      `[CHAT FLOW] Completed LangChain -> Sarvam flow | replyLength=${String(chatResult?.reply || "").length} | chatId=${activeChatId}`,
     );
 
     // If client stopped/disconnected, do not persist or send cancelled response.
@@ -1045,39 +1045,13 @@ app.post("/chat", supabaseAuthRequired, async (req, res) => {
   } catch (err) {
     console.error("âŒ /chat error:", err);
     let reply = "Sorry, an error occurred.";
-    if (err?.code === "LONGCAT_NOT_CONFIGURED") {
+    if (err?.code === "SARVAM_NOT_CONFIGURED" || err?.status === 503) {
       reply =
-        "Normal chat is not configured yet. Add LONGCAT_API_KEY for /chat, or use media upload with OpenRouter.";
-    } else if (err?.code === "LONGCAT_INVALID_API_KEY") {
-      reply = "LongCat API key is invalid or unauthorized. Check LONGCAT_API_KEY.";
-    } else if (err?.code === "LONGCAT_QUOTA_EXHAUSTED") {
-      reply = "LongCat token quota is exhausted. Add or request quota in your LongCat account, then try again.";
-    } else if (err?.code === "LONGCAT_RATE_LIMITED") {
-      reply = "LongCat is rate-limiting requests. Please try again shortly.";
-    } else if (err?.code === "LONGCAT_SERVER_ERROR") {
-      reply = "LongCat is temporarily unavailable. Please try again shortly.";
-    } else if (err?.code === "LONGCAT_INVALID_RESPONSE") {
-      reply = "LongCat returned an unexpected response. Please try again.";
-    } else if (err?.code === "LONGCAT_NETWORK_ERROR") {
-      reply = "Unable to reach LongCat right now. Please try again.";
+        "Normal chat is not configured yet. Add SARVAM_API_KEY for /chat, or use media upload with OpenRouter.";
     } else if (err.name === "AbortError") {
       reply = "Request timeout. Try a smaller request.";
     }
-    const status =
-      err?.code === "LONGCAT_NOT_CONFIGURED"
-        ? 503
-        : err?.code === "LONGCAT_INVALID_API_KEY"
-          ? 401
-          : err?.code === "LONGCAT_QUOTA_EXHAUSTED"
-            ? 402
-            : err?.code === "LONGCAT_RATE_LIMITED"
-              ? 429
-              : err?.code === "LONGCAT_SERVER_ERROR" || err?.code === "LONGCAT_NETWORK_ERROR"
-                ? 502
-                : err?.name === "AbortError"
-                  ? 504
-                  : 500;
-    res.status(status).json({ reply });
+    res.status(500).json({ reply });
   }
 });
 
@@ -1366,7 +1340,7 @@ app.listen(PORT, () => {
   console.log(`
 âœ… Genie Backend (COMPLETE FIXED) Running!
 ðŸ“ Port: ${PORT}
-ðŸ” LONGCAT_API_KEY (chat): ${process.env.LONGCAT_API_KEY ? "Loaded" : "Missing!"}
+ðŸ” SARVAM_API_KEY (chat): ${process.env.SARVAM_API_KEY ? "Loaded" : "Missing!"}
 ðŸ” GEMINI_API_KEY (media): ${process.env.GEMINI_API_KEY ? "Loaded" : "Missing!"}
 ðŸ” DEEPAI_API_KEY (images): ${process.env.DEEPAI_API_KEY ? "Loaded" : "Missing!"}
 ðŸ§  GEMINI_MODEL: ${GEMINI_MODEL}
@@ -1383,7 +1357,7 @@ app.listen(PORT, () => {
 ðŸ’¾ Database: Connected
 ðŸ§¾ Sessions: Max ${MAX_SESSIONS}
 ðŸ§± LangChain Orchestration: Enabled for /chat
-ðŸ¤– Chat Provider: LongCat-2.0
+ðŸ¤– Chat Provider: Sarvam
 
 âœ… CHAT TITLE FIXED - First message will appear as title!
 âœ… DUPLICATE CHAT ENDPOINT REMOVED
