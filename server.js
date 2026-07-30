@@ -1048,10 +1048,21 @@ app.post("/chat", supabaseAuthRequired, async (req, res) => {
     if (err?.code === "SARVAM_NOT_CONFIGURED" || err?.status === 503) {
       reply =
         "Normal chat is not configured yet. Add SARVAM_API_KEY for /chat, or use media upload with OpenRouter.";
+    } else if (err?.code === "SARVAM_INVALID_API_KEY") {
+      reply = "Sarvam API key is invalid or unauthorized. Check SARVAM_API_KEY.";
+    } else if (err?.code === "SARVAM_QUOTA_EXHAUSTED") {
+      reply = "Sarvam token quota is exhausted. Add available quota, then try again.";
+    } else if (err?.code === "SARVAM_RATE_LIMITED") {
+      reply = "Sarvam is rate-limiting requests. Please try again shortly.";
+    } else if (err?.code === "SARVAM_SERVER_ERROR") {
+      reply = "Sarvam is temporarily unavailable. Please try again shortly.";
+    } else if (err?.code === "SARVAM_INVALID_RESPONSE") {
+      reply = "Sarvam returned an unexpected response. Please try again.";
     } else if (err.name === "AbortError") {
       reply = "Request timeout. Try a smaller request.";
     }
-    res.status(500).json({ reply });
+    const status = err?.code === "SARVAM_INVALID_API_KEY" ? 401 : err?.code === "SARVAM_QUOTA_EXHAUSTED" ? 402 : err?.code === "SARVAM_RATE_LIMITED" ? 429 : err?.code === "SARVAM_SERVER_ERROR" || err?.code === "SARVAM_INVALID_RESPONSE" ? 502 : err?.name === "AbortError" ? 504 : 500;
+    res.status(status).json({ reply });
   }
 });
 

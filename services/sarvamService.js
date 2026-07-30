@@ -26,6 +26,18 @@ function normalizeSarvamMessages(messages = [], systemText = "") {
   return turns;
 }
 
+function createSarvamError(status, errorText) {
+  const error = new Error("Sarvam chat request failed");
+  error.status = status;
+  if (status === 401 || status === 403) error.code = "SARVAM_INVALID_API_KEY";
+  else if (status === 402) error.code = "SARVAM_QUOTA_EXHAUSTED";
+  else if (status === 429) error.code = "SARVAM_RATE_LIMITED";
+  else if (status >= 500) error.code = "SARVAM_SERVER_ERROR";
+  else error.code = "SARVAM_REQUEST_FAILED";
+  error.details = String(errorText || "").slice(0, 500);
+  return error;
+}
+
 export function createSarvamService({ apiKey, model = DEFAULT_SARVAM_MODEL, endpoint = "https://api.sarvam.ai/v1/chat/completions" }) {
   function resolveMaxTokens(requestedMaxTokens) {
     const cap = Number(process.env.SARVAM_MAX_TOKENS || SARVAM_STARTER_MAX_TOKENS);
@@ -36,9 +48,12 @@ export function createSarvamService({ apiKey, model = DEFAULT_SARVAM_MODEL, endp
   async function sendChatMessages({ messages, optimizedParams, signal }) {
     const systemText = messages.filter((message) => message?.role === "system").map((message) => getMessageText(message.content)).join("\n\n").trim();
     const response = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json", "api-subscription-key": apiKey }, body: JSON.stringify({ model: String(model || process.env.SARVAM_MODEL || DEFAULT_SARVAM_MODEL).trim().replace(/^models\//i, ""), max_tokens: resolveMaxTokens(optimizedParams?.maxTokens), temperature: optimizedParams?.temperature, messages: normalizeSarvamMessages(messages, systemText) }), signal });
-    if (!response.ok) { const error = new Error("Sarvam chat request failed"); error.status = response.status; console.error("Sarvam error:", response.status, (await response.text()).slice(0, 200)); throw error; }
-    const data = await response.json();
-    return { reply: data?.choices?.[0]?.message?.content || "No response.", usage: data?.usage || null };
+    if (!response.ok) { const errorText = await response.text(); console.error("Sarvam error:", response.status, errorText.slice(0, 200)); throw createSarvamError(response.status, errorText); }
+    let data;
+    try { data = await response.json(); } catch { const error = new Error("Sarvam API returned an invalid response"); error.code = "SARVAM_INVALID_RESPONSE"; error.status = 502; throw error; }
+    const reply = data?.choices?.[0]?.message?.content;
+    if (typeof reply !== "string" || !reply.trim()) { const error = new Error("Sarvam API returned an unexpected response"); error.code = "SARVAM_INVALID_RESPONSE"; error.status = 502; throw error; }
+    return { reply, usage: data?.usage || null };
   }
   return { sendChatMessages };
 }
