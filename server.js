@@ -1050,6 +1050,8 @@ app.post("/chat", supabaseAuthRequired, async (req, res) => {
         "Normal chat is not configured yet. Add LONGCAT_API_KEY for /chat, or use media upload with OpenRouter.";
     } else if (err?.code === "LONGCAT_INVALID_API_KEY") {
       reply = "LongCat API key is invalid or unauthorized. Check LONGCAT_API_KEY.";
+    } else if (err?.code === "LONGCAT_QUOTA_EXHAUSTED") {
+      reply = "LongCat token quota is exhausted. Add or request quota in your LongCat account, then try again.";
     } else if (err?.code === "LONGCAT_RATE_LIMITED") {
       reply = "LongCat is rate-limiting requests. Please try again shortly.";
     } else if (err?.code === "LONGCAT_SERVER_ERROR") {
@@ -1061,7 +1063,21 @@ app.post("/chat", supabaseAuthRequired, async (req, res) => {
     } else if (err.name === "AbortError") {
       reply = "Request timeout. Try a smaller request.";
     }
-    res.status(500).json({ reply });
+    const status =
+      err?.code === "LONGCAT_NOT_CONFIGURED"
+        ? 503
+        : err?.code === "LONGCAT_INVALID_API_KEY"
+          ? 401
+          : err?.code === "LONGCAT_QUOTA_EXHAUSTED"
+            ? 402
+            : err?.code === "LONGCAT_RATE_LIMITED"
+              ? 429
+              : err?.code === "LONGCAT_SERVER_ERROR" || err?.code === "LONGCAT_NETWORK_ERROR"
+                ? 502
+                : err?.name === "AbortError"
+                  ? 504
+                  : 500;
+    res.status(status).json({ reply });
   }
 });
 

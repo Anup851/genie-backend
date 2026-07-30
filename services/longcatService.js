@@ -30,12 +30,27 @@ function normalizeLongCatMessages(messages = []) {
 }
 
 function createLongCatError(status, errorText) {
+  const details = String(errorText || "").slice(0, 500);
+  let providerError = {};
+  try {
+    providerError = JSON.parse(details)?.error || {};
+  } catch {}
+  const providerCode = String(providerError?.code || "").toLowerCase();
+  const providerType = String(providerError?.type || "").toLowerCase();
   let message = "LongCat chat request failed";
   let code = "LONGCAT_REQUEST_FAILED";
   if (status === 401 || status === 403) {
     message = "LongCat API key is invalid or unauthorized";
     code = "LONGCAT_INVALID_API_KEY";
-  } else if (status === 429) {
+  } else if (status === 402 || providerCode === "insufficient_quota") {
+    message = "LongCat API token quota is exhausted";
+    code = "LONGCAT_QUOTA_EXHAUSTED";
+  } else if (
+    status === 429 ||
+    providerCode === "too_many_requests" ||
+    providerCode === "rate_limit_exceeded" ||
+    providerType === "rate_limit_error"
+  ) {
     message = "LongCat API rate limit exceeded";
     code = "LONGCAT_RATE_LIMITED";
   } else if (status >= 500) {
@@ -45,7 +60,7 @@ function createLongCatError(status, errorText) {
   const error = new Error(message);
   error.code = code;
   error.status = status;
-  error.details = String(errorText || "").slice(0, 500);
+  error.details = details;
   return error;
 }
 
